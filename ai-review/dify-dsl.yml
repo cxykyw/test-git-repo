@@ -20,9 +20,9 @@ workflow:
           sourceType: start
           targetType: llm
         id: edge-start-llm
-        source: node-start
+        source: node_start
         sourceHandle: source
-        target: node-llm
+        target: node_llm
         type: custom
         zIndex: 0
       - data:
@@ -30,9 +30,9 @@ workflow:
           sourceType: llm
           targetType: end
         id: edge-llm-end
-        source: node-llm
+        source: node_llm
         sourceHandle: source
-        target: node-end
+        target: node_end
         type: custom
         zIndex: 0
     nodes:
@@ -55,7 +55,7 @@ workflow:
               type: paragraph
               variable: rules
         height: 116
-        id: node-start
+        id: node_start
         position:
           x: 80
           y: 280
@@ -84,12 +84,12 @@ workflow:
               text: |
                 你是资深代码审查员，依据给定规则审查代码 diff。
                 审查规则：
-                {{#node-start.rules#}}
+                {{#node_start.rules#}}
             - id: prompt-user
               role: user
               text: |
                 请审查以下代码 diff，严格按照规则中规定的 JSON 格式输出结论，不要输出 JSON 以外的任何内容：
-                {{#node-start.diff#}}
+                {{#node_start.diff#}}
           selected: false
           title: LLM 审核
           type: llm
@@ -97,7 +97,7 @@ workflow:
           vision:
             enabled: false
         height: 90
-        id: node-llm
+        id: node_llm
         position:
           x: 380
           y: 280
@@ -113,14 +113,14 @@ workflow:
           desc: ''
           outputs:
             - value_selector:
-                - node-llm
+                - node_llm
                 - text
               variable: review
           selected: false
           title: 结束
           type: end
         height: 90
-        id: node-end
+        id: node_end
         position:
           x: 700
           y: 280

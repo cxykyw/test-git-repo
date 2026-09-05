@@ -1,2 +1,6 @@
 dist/
 *.zip
+semgrep.json
+gitleaks.json
+trivy.json
+gate-result.json

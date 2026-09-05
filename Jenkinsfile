@@ -11,7 +11,7 @@ pipeline {
             parallel {
                 stage('Semgrep SAST') {
                     steps {
-                        sh 'export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"; semgrep scan --config p/default --json --metrics=off --quiet -o semgrep.json || true'
+                        sh 'export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"; semgrep scan --config p/default --config p/security-audit --config p/owasp-top-ten --json --metrics=off --quiet -o semgrep.json || true'
                     }
                 }
                 stage('Gitleaks') {

@@ -7,7 +7,8 @@ Jenkins 流水线验证仓库（手动触发，不配轮询/webhook）。
 拉代码 → 安全扫描（Semgrep / Gitleaks / Trivy 并行）→ 质量门禁（gate.sh）→ AI 审核（ai_review.py，advisory）→ 打包（build.sh）→ 归档产物。
 
 - `gate.sh`：确定性门禁。gitleaks 密钥 / semgrep ERROR 级 / trivy CRITICAL 漏洞任一命中即 FAIL
-- `ai_review.py`：取最近一次提交的 diff（超过 2000 行截断），连同 `ai-review/rules.md` 发给 Dify 工作流 `ai-code-review`，解析 JSON 结论。默认 advisory 模式（结果只展示不阻断）；在 Jenkins 环境变量里设 `DIFY_BLOCKING=1` 后，verdict=fail 会阻断打包
+- `ai_review.py`：取最近一次提交的 diff（超过 2000 行截断）发给 Dify 工作流 `ai-code-review`，解析 JSON 结论。默认 advisory 模式（结果只展示不阻断）；在 Jenkins 环境变量里设 `DIFY_BLOCKING=1` 后，verdict=fail 会阻断打包
+- 审核规则内置于 Dify 工作流 LLM 节点的系统提示词：在 Dify 工作室打开该应用 → LLM 节点 → 修改规则 → 发布，下次构建即生效
 - Dify 接入：读取 `~/.config/code-review/dify_api_key`（应用 API 密钥），默认地址 `http://localhost:80`，可用环境变量 `DIFY_URL` 覆盖。工作流定义见 `ai-review/dify-dsl.yml`
 - `build.sh`：打包脚本，产出 `app-<commit>-<构建号>.zip`
 - 扫描报告与 AI 审核结果（semgrep.json / gitleaks.json / trivy.json / gate-result.json / ai-review-result.json）随构建归档，可在构建页面下载

@@ -3,7 +3,6 @@ set -euo pipefail
 
 python3 - <<'PYEOF'
 import json, os, sys
-from datetime import datetime, timezone
 
 def load(path):
     if not os.path.exists(path):
@@ -54,13 +53,10 @@ for s in skipped:
     failures.append(f"warning: scanner '{s}' did not produce a report (skipped)")
 
 verdict = 'FAIL' if any(not f.startswith('warning:') for f in failures) else 'PASS'
-report = {
-    'generated_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
-    'quality_gate': {**summary, 'verdict': verdict, 'failures': failures},
-    'ai_review': None,
-}
-with open('report.json', 'w') as f:
-    json.dump(report, f, ensure_ascii=False, indent=2)
+gate = {**summary, 'verdict': verdict, 'failures': failures}
+os.makedirs('scan', exist_ok=True)
+with open('scan/gate.json', 'w') as f:
+    json.dump(gate, f, ensure_ascii=False, indent=2)
 
 print('gate summary:', json.dumps(summary, ensure_ascii=False))
 if failures:

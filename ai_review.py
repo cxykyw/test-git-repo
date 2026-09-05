@@ -109,18 +109,11 @@ def read_text(path):
     return ""
 
 
-def update_report(ai_section):
-    """Merge the AI section into report.json (gate section is written by gate.sh)."""
-    try:
-        report = {}
-        if os.path.exists("report.json"):
-            with open("report.json") as f:
-                report = json.load(f)
-        report["ai_review"] = ai_section
-        with open("report.json", "w") as f:
-            json.dump(report, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print("report.json 更新失败: %s" % e)
+def save_ai_result(ai_section):
+    """Write the AI section to scan/ai.json (make_report.py merges it into report.html)."""
+    os.makedirs('scan', exist_ok=True)
+    with open('scan/ai.json', 'w') as f:
+        json.dump(ai_section, f, ensure_ascii=False, indent=2)
 
 
 def review_chunk(rules, key, index, chunk):
@@ -172,7 +165,7 @@ def main():
     raw_diff = get_raw_diff()
     if not raw_diff.strip():
         print("AI review: no diff to review (skipped)")
-        update_report({"verdict": "skipped", "reason": "无 diff"})
+        save_ai_result({"verdict": "skipped", "reason": "无 diff"})
         return 0
 
     files, skipped = [], {}
@@ -194,7 +187,7 @@ def main():
         files.append((path, patch, truncated))
     if not files:
         print("AI review: all changed files are out of review scope (skipped)")
-        update_report({"verdict": "skipped", "reason": "全部文件在审查范围外", "skipped": skipped})
+        save_ai_result({"verdict": "skipped", "reason": "全部文件在审查范围外", "skipped": skipped})
         return 0
 
     chunks = build_chunks(files)
@@ -207,7 +200,7 @@ def main():
     key = read_text(KEY_FILE).strip()
     if not key:
         print("AI review skipped: no Dify API key at %s" % KEY_FILE)
-        update_report({"verdict": "skipped", "reason": "未配置 Dify API key", "skipped": skipped})
+        save_ai_result({"verdict": "skipped", "reason": "未配置 Dify API key", "skipped": skipped})
         return 0
 
     print("AI review: %d 个文件 -> %d 个分片（并行 %d）" % (len(files), len(chunks), MAX_WORKERS))
@@ -272,7 +265,7 @@ def main():
             "blocking_findings": len(hard_findings),
         },
     }
-    update_report({
+    save_ai_result({
         "verdict": verdict,
         "summary": result["summary"],
         "findings": findings,
@@ -305,5 +298,5 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as e:
         print("AI review skipped: unexpected error: %s" % e)
-        update_report({"verdict": "skipped", "reason": "unexpected error: %s" % e})
+        save_ai_result({"verdict": "skipped", "reason": "unexpected error: %s" % e})
         sys.exit(0)

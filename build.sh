@@ -5,5 +5,5 @@ STAMP="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)-${BUILD_NUMBER:
 ZIP_NAME="app-${STAMP}.zip"
 
 rm -f ./*.zip
-zip -qr "${ZIP_NAME}" . -x '.git/*' '*.zip' 'dist/*' 'scan/*' 'report.json'
+zip -qr "${ZIP_NAME}" . -x '.git/*' '*.zip' 'dist/*' 'scan/*' 'report.html'
 ls -lh "${ZIP_NAME}"

@@ -48,7 +48,8 @@ pipeline {
 
     post {
         always {
-            archiveArtifacts artifacts: '*.zip,report.json', allowEmptyArchive: true, fingerprint: true
+            sh 'python3 make_report.py || true'
+            archiveArtifacts artifacts: '*.zip,report.html', allowEmptyArchive: true, fingerprint: true
         }
     }
 }

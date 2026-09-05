@@ -38,13 +38,14 @@ __AI_SECTION__
 
 
 def load(path):
-    if os.path.exists(path):
-        try:
-            with open(path) as f:
-                return json.load(f)
-        except Exception:
-            return None
-    return None
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print("警告: %s 读取失败: %s" % (path, e))
+        return None
 
 
 def badge(text, kind):
@@ -52,11 +53,13 @@ def badge(text, kind):
 
 
 def verdict_badge(verdict, pass_text, fail_text):
+    if not verdict:
+        return badge("未执行", "gray")
     if verdict == "PASS" or verdict == "pass":
         return badge(pass_text, "ok")
     if verdict in ("FAIL", "fail"):
         return badge(fail_text, "bad")
-    return badge(str(verdict) or "未执行", "gray")
+    return badge(str(verdict), "gray")
 
 
 def gate_section(gate):
@@ -99,7 +102,7 @@ def ai_section(ai):
     )
     rows = "".join(
         "<tr><td>%s</td><td><code>%s:%s</code></td><td>%s</td><td>%s</td></tr>" % (
-            badge(f.get("severity") or "info", str(f.get("severity") or "info").lower()),
+            badge(f.get("severity") or "info", "sev-" + str(f.get("severity") or "info").lower()),
             html.escape(str(f.get("file") or "-")), html.escape(str(f.get("line", "-"))),
             html.escape(str(f.get("message") or "")),
             html.escape(str(f.get("suggestion") or "-")))
@@ -131,7 +134,7 @@ def main():
         .replace("__GATE_SECTION__", gate_section(gate))
         .replace("__AI_SECTION__", ai_section(ai))
     )
-    with open("report.html", "w") as f:
+    with open("report.html", "w", encoding="utf-8") as f:
         f.write(page)
     print("report.html generated")
 

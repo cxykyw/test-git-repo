@@ -10,8 +10,14 @@ stay display-only. Infrastructure errors degrade to a skipped review
 (exit 0) so the deterministic gate remains the only hard blocker outside
 blocking mode.
 
-Results are merged into report.json (unified build report; the quality-gate
-section is written by gate.sh, this script only fills the ai_review part).
+Results are merged into the unified build report: this script writes the
+ai_review section to scan/ai.json (make_report.py renders report.html;
+the quality-gate section comes from gate.sh via scan/gate.json).
+
+The diff base is tracked across builds in .ai-review-base (in the job
+workspace) and advanced only after a fully reviewed run, so commits pushed
+between builds are never skipped. GIT_PREVIOUS_COMMIT /
+GIT_PREVIOUS_SUCCESSFUL_COMMIT and HEAD~1 serve as fallbacks.
 """
 import json
 import os
@@ -32,6 +38,7 @@ BLOCK_SEVERITIES = {
     if s.strip()
 }
 RULES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai-review", "rules.md")
+BASE_MARKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ai-review-base")
 
 CHUNK_CHAR_BUDGET = int(os.environ.get("AI_REVIEW_CHUNK_CHARS", "100000"))
 FILE_LINE_CAP = int(os.environ.get("AI_REVIEW_FILE_LINES", "800"))
@@ -51,12 +58,42 @@ def sh(args):
     return subprocess.run(args, capture_output=True, text=True).stdout.strip()
 
 
-def get_raw_diff():
-    head = os.environ.get("GIT_COMMIT")
-    prev = os.environ.get("GIT_PREVIOUS_COMMIT")
-    if head and prev:
-        return sh(["git", "diff", prev, head])
-    return sh(["git", "diff", "HEAD~1", "HEAD"])
+def rev_parse(rev):
+    r = subprocess.run(["git", "rev-parse", "--verify", rev + "^{commit}"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def merge_base(a, b):
+    r = subprocess.run(["git", "merge-base", a, b], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def resolve_base():
+    """Review base commit: last fully reviewed HEAD from the workspace marker,
+    else Jenkins-injected previous commit, else HEAD~1. merge-base guards
+    against rewritten history; unresolvable candidates fall through."""
+    head = rev_parse("HEAD")
+    candidates = []
+    if os.path.exists(BASE_MARKER):
+        marker = read_text(BASE_MARKER).strip()
+        if marker:
+            candidates.append((marker, ".ai-review-base（上次已审基点）"))
+    for env in ("GIT_PREVIOUS_COMMIT", "GIT_PREVIOUS_SUCCESSFUL_COMMIT"):
+        v = os.environ.get(env, "").strip()
+        if v:
+            candidates.append((v, env))
+    for rev, source in candidates:
+        base = merge_base(rev, head) if head else ""
+        if base:
+            return base, source
+    return "HEAD~1", "默认 HEAD~1（首次构建或无可用基点）"
+
+
+def get_review_range():
+    base, source = resolve_base()
+    head = rev_parse("HEAD")
+    diff = sh(["git", "diff", base, head]) if head else ""
+    return diff, base, head, source
 
 
 def split_files(raw_diff):
@@ -104,7 +141,7 @@ def build_chunks(files):
 
 def read_text(path):
     if os.path.exists(path):
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return f.read()
     return ""
 
@@ -162,7 +199,8 @@ def review_chunk(rules, key, index, chunk):
 
 
 def main():
-    raw_diff = get_raw_diff()
+    raw_diff, base, head, base_source = get_review_range()
+    print("AI review 范围: %s..%s（基点: %s）" % (base[:8], head[:8] or "HEAD", base_source))
     if not raw_diff.strip():
         print("AI review: no diff to review (skipped)")
         save_ai_result({"verdict": "skipped", "reason": "无 diff"})
@@ -271,6 +309,11 @@ def main():
         "findings": findings,
         "meta": result["meta"],
     })
+    # 基点只在整段范围都审完时推进：有分片未审完或文件超分片上限时，
+    # 下次构建仍从旧基点重审，避免漏审
+    if not overflow_files and not unreviewed and head:
+        with open(BASE_MARKER, "w") as f:
+            f.write(head + "\n")
 
     print("AI review verdict: %s (%d findings)" % (verdict, len(findings)))
     print("summary:", result["summary"])

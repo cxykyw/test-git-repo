@@ -8,3 +8,4 @@ ai-review-result.json
 .DS_Store
 scan/
 report.html
+.ai-review-base

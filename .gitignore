@@ -5,3 +5,4 @@ gitleaks.json
 trivy.json
 gate-result.json
 ai-review-result.json
+.DS_Store

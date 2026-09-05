@@ -16,6 +16,7 @@ MAX_DIFF_LINES = 2000
 DIFY_URL = os.environ.get("DIFY_URL", "http://localhost:80")
 KEY_FILE = os.path.expanduser("~/.config/code-review/dify_api_key")
 BLOCKING = os.environ.get("DIFY_BLOCKING", "") == "1"
+RULES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai-review", "rules.md")
 
 
 def sh(args):
@@ -41,6 +42,11 @@ def main():
     if len(lines) > MAX_DIFF_LINES:
         diff = "\n".join(lines[:MAX_DIFF_LINES]) + "\n... (truncated, %d lines total)" % len(lines)
 
+    rules = ""
+    if os.path.exists(RULES):
+        with open(RULES) as f:
+            rules = f.read()
+
     key = ""
     if os.path.exists(KEY_FILE):
         with open(KEY_FILE) as f:
@@ -50,7 +56,7 @@ def main():
         return 0
 
     payload = json.dumps({
-        "inputs": {"diff": diff},
+        "inputs": {"diff": diff, "rules": rules},
         "response_mode": "blocking",
         "user": "jenkins",
     }).encode()

@@ -104,6 +104,36 @@ workflow:
                 请审查以下代码 diff，严格按照系统提示词中的输出要求输出 JSON，不要输出任何其他内容：
                 {{#node_start.diff#}}
           selected: false
+          structured_output:
+            schema:
+              type: object
+              properties:
+                verdict:
+                  type: string
+                  enum: [pass, fail]
+                summary:
+                  type: string
+                findings:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      file:
+                        type: string
+                      line:
+                        type: integer
+                      severity:
+                        type: string
+                        enum: [blocker, major, minor, info]
+                      message:
+                        type: string
+                      suggestion:
+                        type: string
+                    required: [file, severity, message]
+                    additionalProperties: false
+              required: [verdict, summary, findings]
+              additionalProperties: false
+          structured_output_enabled: true
           title: LLM 审核
           type: llm
           variables: []

@@ -73,16 +73,20 @@ def main():
         return 0
 
     out = (body.get("data") or {}).get("outputs") or {}
-    raw = str(out.get("review") or out.get("text") or "").strip()
-    if raw.startswith("```"):
-        raw = raw.strip("`").strip()
-        if raw.startswith("json"):
-            raw = raw[4:].strip()
-    try:
-        result = json.loads(raw)
-    except Exception:
-        print("AI review skipped: unparseable model output:\n%s" % raw[:500])
-        return 0
+    raw = out.get("review") or out.get("text") or ""
+    if isinstance(raw, dict):
+        result = raw
+    else:
+        raw = str(raw).strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`").strip()
+            if raw.startswith("json"):
+                raw = raw[4:].strip()
+        try:
+            result = json.loads(raw)
+        except Exception:
+            print("AI review skipped: unparseable model output:\n%s" % raw[:500])
+            return 0
 
     findings = result.get("findings", [])
     verdict = result.get("verdict", "pass")

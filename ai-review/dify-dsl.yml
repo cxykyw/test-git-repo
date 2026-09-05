@@ -1,0 +1,135 @@
+app:
+  description: AI 代码审核：输入 diff 和规则，输出 JSON 审核结论（verdict/findings）
+  icon: "\U0001F916"
+  icon_background: "#FFEAD5"
+  mode: workflow
+  name: ai-code-review
+  use_icon_as_answer_icon: false
+kind: app
+version: 0.1.5
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      enabled: false
+  graph:
+    edges:
+      - data:
+          isInIteration: false
+          sourceType: start
+          targetType: llm
+        id: edge-start-llm
+        source: node-start
+        sourceHandle: source
+        target: node-llm
+        type: custom
+        zIndex: 0
+      - data:
+          isInIteration: false
+          sourceType: llm
+          targetType: end
+        id: edge-llm-end
+        source: node-llm
+        sourceHandle: source
+        target: node-end
+        type: custom
+        zIndex: 0
+    nodes:
+      - data:
+          desc: ''
+          selected: false
+          title: 开始
+          type: start
+          variables:
+            - label: diff
+              max_length: 200000
+              options: []
+              required: true
+              type: paragraph
+              variable: diff
+            - label: rules
+              max_length: 20000
+              options: []
+              required: false
+              type: paragraph
+              variable: rules
+        height: 116
+        id: node-start
+        position:
+          x: 80
+          y: 280
+        positionAbsolute:
+          x: 80
+          y: 280
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+      - data:
+          context:
+            enabled: false
+            variable_selector: []
+          desc: ''
+          model:
+            completion_params:
+              temperature: 0
+            mode: chat
+            name: doubao-pro-32k
+            provider: langgenius/volcengine_maas/volcengine_maas
+          prompt_template:
+            - id: prompt-system
+              role: system
+              text: |
+                你是资深代码审查员，依据给定规则审查代码 diff。
+                审查规则：
+                {{#node-start.rules#}}
+            - id: prompt-user
+              role: user
+              text: |
+                请审查以下代码 diff，严格按照规则中规定的 JSON 格式输出结论，不要输出 JSON 以外的任何内容：
+                {{#node-start.diff#}}
+          selected: false
+          title: LLM 审核
+          type: llm
+          variables: []
+          vision:
+            enabled: false
+        height: 90
+        id: node-llm
+        position:
+          x: 380
+          y: 280
+        positionAbsolute:
+          x: 380
+          y: 280
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+      - data:
+          desc: ''
+          outputs:
+            - value_selector:
+                - node-llm
+                - text
+              variable: review
+          selected: false
+          title: 结束
+          type: end
+        height: 90
+        id: node-end
+        position:
+          x: 700
+          y: 280
+        positionAbsolute:
+          x: 700
+          y: 280
+        selected: false
+        sourcePosition: right
+        targetPosition: left
+        type: custom
+        width: 244
+  hash: ''

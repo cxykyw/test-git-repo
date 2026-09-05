@@ -33,6 +33,12 @@ pipeline {
             }
         }
 
+        stage('AI Review') {
+            steps {
+                sh 'python3 ai_review.py'
+            }
+        }
+
         stage('Package') {
             steps {
                 sh './build.sh'

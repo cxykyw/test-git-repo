@@ -9,3 +9,4 @@ ai-review-result.json
 scan/
 report.html
 .ai-review-base
+__pycache__/

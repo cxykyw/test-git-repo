@@ -6,3 +6,5 @@ trivy.json
 gate-result.json
 ai-review-result.json
 .DS_Store
+scan/
+report.json

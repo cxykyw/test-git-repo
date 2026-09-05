@@ -2,11 +2,16 @@
 """AI code review bridge: git diff -> Dify workflow (chunked, parallel) -> merged verdict.
 
 Large diffs are split at file boundaries into chunks under a char budget,
-reviewed in parallel, then merged deterministically. Advisory by default:
-never fails the build unless DIFY_BLOCKING=1 and any chunk verdict is 'fail'
-(or a chunk could not be reviewed). Infrastructure errors degrade to a
-skipped review (exit 0) so the deterministic gate remains the only hard
-blocker outside blocking mode.
+reviewed in parallel, then merged deterministically. Advisory by default.
+With DIFY_BLOCKING=1 the build fails only on blocker/critical-severity
+findings (AI_REVIEW_BLOCK_SEVERITIES overrides the set) or when a chunk
+could not be reviewed or files overflowed the chunk limit; major and below
+stay display-only. Infrastructure errors degrade to a skipped review
+(exit 0) so the deterministic gate remains the only hard blocker outside
+blocking mode.
+
+Results are merged into report.json (unified build report; the quality-gate
+section is written by gate.sh, this script only fills the ai_review part).
 """
 import json
 import os
@@ -16,17 +21,29 @@ import sys
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 DIFY_URL = os.environ.get("DIFY_URL", "http://localhost:80")
 KEY_FILE = os.path.expanduser("~/.config/code-review/dify_api_key")
 BLOCKING = os.environ.get("DIFY_BLOCKING", "") == "1"
+BLOCK_SEVERITIES = {
+    s.strip().lower()
+    for s in os.environ.get("AI_REVIEW_BLOCK_SEVERITIES", "blocker,critical").split(",")
+    if s.strip()
+}
 RULES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai-review", "rules.md")
 
 CHUNK_CHAR_BUDGET = int(os.environ.get("AI_REVIEW_CHUNK_CHARS", "100000"))
 FILE_LINE_CAP = int(os.environ.get("AI_REVIEW_FILE_LINES", "800"))
 MAX_CHUNKS = int(os.environ.get("AI_REVIEW_MAX_CHUNKS", "40"))
 MAX_WORKERS = int(os.environ.get("AI_REVIEW_WORKERS", "3"))
-SKIP_RE = re.compile(r"(^|/)(package-lock\.json|.*\.lock)$|^(dist|build|vendor|target)/|generated", re.I)
+SKIP_RE = re.compile(
+    r"(^|/)(package-lock\.json|.*\.lock)$"
+    r"|^(dist|build|vendor|target)(/|$)"
+    r"|(^|/)generated(/|$)"
+    r"|_pb2\.(py|go)$"
+    r"|\.min\.(js|css)$"
+)
 DIFF_SPLIT_RE = re.compile(r"(?=^diff --git )", re.M)
 
 
@@ -53,10 +70,23 @@ def file_path_of(patch):
 
 
 def cap_patch(patch):
+    truncated = False
     lines = patch.splitlines()
-    if len(lines) <= FILE_LINE_CAP:
-        return patch, False
-    return "\n".join(lines[:FILE_LINE_CAP]) + "\n... (该文件 diff 超过 %d 行，已截断)" % FILE_LINE_CAP, True
+    if len(lines) > FILE_LINE_CAP:
+        patch = "\n".join(lines[:FILE_LINE_CAP])
+        truncated = True
+    char_cap = max(CHUNK_CHAR_BUDGET - 4000, 2000)
+    if len(patch) > char_cap:
+        cut = patch.rfind("\n", 0, char_cap)
+        patch = patch[: cut if cut > 0 else char_cap]
+        truncated = True
+    if truncated:
+        patch += "\n... (该文件 diff 超长，已截断)"
+    return patch, truncated
+
+
+def severity_of(finding):
+    return str(finding.get("severity") or "").strip().lower()
 
 
 def build_chunks(files):
@@ -77,6 +107,20 @@ def read_text(path):
         with open(path) as f:
             return f.read()
     return ""
+
+
+def update_report(ai_section):
+    """Merge the AI section into report.json (gate section is written by gate.sh)."""
+    try:
+        report = {}
+        if os.path.exists("report.json"):
+            with open("report.json") as f:
+                report = json.load(f)
+        report["ai_review"] = ai_section
+        with open("report.json", "w") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("report.json 更新失败: %s" % e)
 
 
 def review_chunk(rules, key, index, chunk):
@@ -128,29 +172,42 @@ def main():
     raw_diff = get_raw_diff()
     if not raw_diff.strip():
         print("AI review: no diff to review (skipped)")
+        update_report({"verdict": "skipped", "reason": "无 diff"})
         return 0
 
-    files, skipped = [], []
+    files, skipped = [], {}
     for patch in split_files(raw_diff):
         path, ok = file_path_of(patch)
-        if not ok or SKIP_RE.search(path):
-            skipped.append(path)
+        if not ok:
+            skipped[path] = "无法解析"
+            continue
+        if SKIP_RE.search(path):
+            skipped[path] = "范围外文件"
+            continue
+        if "GIT binary patch" in patch or "\nBinary files " in patch:
+            skipped[path] = "二进制文件"
+            continue
+        if not any(l.startswith("+") and not l.startswith("+++") for l in patch.splitlines()):
+            skipped[path] = "纯删除"
             continue
         patch, truncated = cap_patch(patch)
         files.append((path, patch, truncated))
     if not files:
         print("AI review: all changed files are out of review scope (skipped)")
+        update_report({"verdict": "skipped", "reason": "全部文件在审查范围外", "skipped": skipped})
         return 0
 
     chunks = build_chunks(files)
+    overflow_files = []
     if len(chunks) > MAX_CHUNKS:
-        skipped += [p for c in chunks[MAX_CHUNKS:] for p, _, _ in c]
+        overflow_files = [p for c in chunks[MAX_CHUNKS:] for p, _, _ in c]
         chunks = chunks[:MAX_CHUNKS]
 
     rules = read_text(RULES)
     key = read_text(KEY_FILE).strip()
     if not key:
         print("AI review skipped: no Dify API key at %s" % KEY_FILE)
+        update_report({"verdict": "skipped", "reason": "未配置 Dify API key", "skipped": skipped})
         return 0
 
     print("AI review: %d 个文件 -> %d 个分片（并行 %d）" % (len(files), len(chunks), MAX_WORKERS))
@@ -178,42 +235,67 @@ def main():
             seen.add(dedupe_key)
             findings.append(f)
     unreviewed = [r for r in results if r.get("_error")]
-    verdict = "fail" if any(r.get("verdict") == "fail" for r in results) else "pass"
-    if unreviewed and BLOCKING:
-        verdict = "fail"
+    if unreviewed:
         findings.append({
             "file": "-", "line": 0, "severity": "major",
-            "message": "部分分片未能完成 AI 审核: " + "; ".join(r["_error"] for r in unreviewed),
+            "message": "%d 个分片未能完成 AI 审核: %s" % (len(unreviewed), "; ".join(r["_error"] for r in unreviewed)[:200]),
             "suggestion": "检查 Dify 服务后重新触发构建",
         })
+    if overflow_files:
+        findings.append({
+            "file": "-", "line": 0, "severity": "major",
+            "message": "%d 个文件超出分片上限未审核: %s" % (len(overflow_files), ", ".join(overflow_files[:5])),
+            "suggestion": "提高 AI_REVIEW_MAX_CHUNKS 或拆分提交",
+        })
+    verdict = "fail" if any(r.get("verdict") == "fail" for r in results) else "pass"
     truncated = [p for p, _, t in files if t]
+    hard_findings = [f for f in findings if severity_of(f) in BLOCK_SEVERITIES]
     if skipped:
-        print("AI review 跳过文件: %s%s" % (", ".join(skipped[:8]), "..." if len(skipped) > 8 else ""))
+        print("AI review 跳过文件: %s" % "; ".join("%s(%s)" % (p, reason) for p, reason in list(skipped.items())[:8]))
 
     result = {
         "verdict": verdict,
-        "summary": "%d 个文件 / %d 个分片: %d 条发现%s%s" % (
+        "summary": "%d 个文件 / %d 个分片: %d 条发现%s%s%s" % (
             len(files), len(results), len(findings),
             "，%d 个分片未完成审核" % len(unreviewed) if unreviewed else "",
+            "，%d 个文件超出分片上限" % len(overflow_files) if overflow_files else "",
             "，%d 个文件超长截断" % len(truncated) if truncated else "",
         ),
         "findings": findings,
         "meta": {
             "chunks": len(results), "unreviewed_chunks": len(unreviewed),
-            "files": len(files), "skipped_files": skipped,
+            "files": len(files),
+            "skipped": [{"file": p, "reason": reason} for p, reason in skipped.items()],
             "truncated_files": truncated,
+            "overflow_files": overflow_files,
+            "blocking_severities": sorted(BLOCK_SEVERITIES),
+            "blocking_findings": len(hard_findings),
         },
     }
-    with open("ai-review-result.json", "w") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+    update_report({
+        "verdict": verdict,
+        "summary": result["summary"],
+        "findings": findings,
+        "meta": result["meta"],
+    })
 
     print("AI review verdict: %s (%d findings)" % (verdict, len(findings)))
     print("summary:", result["summary"])
     for f_ in findings[:12]:
         print("  [%s] %s:%s %s" % (f_.get("severity"), f_.get("file"), f_.get("line", "-"), str(f_.get("message"))[:90]))
-    if BLOCKING and verdict == "fail":
-        print("AI review: blocking mode and verdict=fail -> failing build")
-        return 1
+    if BLOCKING:
+        blocking_reasons = []
+        if hard_findings:
+            blocking_reasons.append("%d 条 %s 级发现" % (len(hard_findings), "/".join(sorted(BLOCK_SEVERITIES))))
+        if unreviewed:
+            blocking_reasons.append("%d 个分片未完成审核" % len(unreviewed))
+        if overflow_files:
+            blocking_reasons.append("%d 个文件超出分片上限未审核" % len(overflow_files))
+        if blocking_reasons:
+            print("AI review: blocking mode -> failing build (%s)" % "; ".join(blocking_reasons))
+            return 1
+        print("AI review: blocking mode, 无阻断级发现（major 以下仅展示）-> 继续构建")
+        return 0
     print("AI review: advisory mode (set DIFY_BLOCKING=1 in Jenkins to enforce)")
     return 0
 
@@ -223,4 +305,5 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as e:
         print("AI review skipped: unexpected error: %s" % e)
+        update_report({"verdict": "skipped", "reason": "unexpected error: %s" % e})
         sys.exit(0)

@@ -11,17 +11,17 @@ pipeline {
             parallel {
                 stage('Semgrep SAST') {
                     steps {
-                        sh 'export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"; semgrep scan --config p/default --config p/security-audit --config p/owasp-top-ten --json --metrics=off --quiet -o semgrep.json || true'
+                        sh 'export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"; mkdir -p scan; semgrep scan --config p/default --config p/security-audit --config p/owasp-top-ten --json --metrics=off --quiet -o scan/semgrep.json || true'
                     }
                 }
                 stage('Gitleaks') {
                     steps {
-                        sh 'export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"; gitleaks detect --no-git --report-format json --report-path gitleaks.json || true'
+                        sh 'export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"; mkdir -p scan; gitleaks detect --no-git --report-format json --report-path scan/gitleaks.json || true'
                     }
                 }
                 stage('Trivy') {
                     steps {
-                        sh 'export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"; trivy fs --scanners vuln --format json --output trivy.json . || true'
+                        sh 'export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"; mkdir -p scan; trivy fs --scanners vuln --format json --output scan/trivy.json . || true'
                     }
                 }
             }
@@ -48,7 +48,7 @@ pipeline {
 
     post {
         always {
-            archiveArtifacts artifacts: '*.json,*.zip', allowEmptyArchive: true, fingerprint: true
+            archiveArtifacts artifacts: '*.zip,report.json', allowEmptyArchive: true, fingerprint: true
         }
     }
 }

@@ -24,7 +24,7 @@ pipeline {
                 script {
                     // 首次运行参数尚未注册时回落 main；分支名白名单校验防 shell 注入
                     def branch = params.BRANCH ?: 'main'
-                    if (!(branch ==~ /[A-Za-z0-9._\/-]+/) || branch.contains('..') || branch.startsWith('-')) {
+                    if (!(branch ==~ /^[A-Za-z0-9._\/-]+$/) || branch.contains('..') || branch.startsWith('-')) {
                         error("非法分支名: ${branch}")
                     }
                     echo "构建分支: ${branch}"

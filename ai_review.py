@@ -194,8 +194,10 @@ def review_chunk(rules, key, index, chunk):
             # LLM 常在字符串值里输出未转义的控制字符（如裸换行），strict 模式会拒绝
             try:
                 result = json.loads(raw, strict=False)
-            except Exception:
-                return failed("模型输出解析失败: %s" % raw[:200])
+            except Exception as e:
+                return failed("模型输出解析失败: %s (%s)" % (e, raw[:200]))
+    if not isinstance(result, dict):
+        return failed("模型输出非 JSON 对象（类型 %s）: %s" % (type(result).__name__, str(result)[:200]))
     result.setdefault("verdict", "pass")
     result.setdefault("findings", [])
     result["_files"] = files

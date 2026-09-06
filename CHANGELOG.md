@@ -2,6 +2,7 @@
 
 ## 2026-09-06
 
+- fix: **消化第三轮 AI 审核发现（verdict 首次 pass）**——`sh()` 用 None 区分"超时失败"与"空输出"，git diff 超时路由到台账保留路径而非冒充"无新增 diff"；`rev_parse`/`merge_base` 超时告警避免静默误判基点；落账遇 `GitTimeout` 重试一次减少"下轮漏拦"窗口；`current_branch` 检查 returncode
 - fix: **台账核对三态化（AI 审核第二轮自检发现）**——git 超时从"静默当作文件缺失=已修复"改为"不可判定保留条目"（宁可多拦不可误放）；落账遇超时本轮跳过；上下文提取超时退化为无上下文；git 各环节（sh/rev_parse/merge_base/current_branch）超时统一优雅降级；台账写入补 fsync 与临时文件清理；`find_context` 的 near 参数类型防御；Jenkinsfile 正则显式锚定；`_int_env` 提示语义与行为对齐
 - fix: **消化首次真实构建的 AI 审核发现**——`_int_env` 非法环境变量容错（原会在导入期崩溃）、git 子进程统一加超时、台账原子写（中断不损坏）、指纹窗口在文件边缘平移保持 3 行（原会缩成 1-2 行易误匹配）、`find_context` 多处命中时取最接近上次行号的匹配、重试加退避、Jenkinsfile 分支白名单排除 `..` 与前导 `-`；清理"分片"术语残留（ai_review/make_report/README）
 - feat: **文件任务模型**——审核单元从"100K 字符分片"重构为固定预算的文件任务（默认 12K 字符）：diff + HEAD 上下文 + semgrep 线索合计为常数上界，**单次调用输入与变更总量无关**；单文件超预算按 hunk 组拆段（单 hunk 再按行切），相邻小文件自动合并；并行 worker 3→6

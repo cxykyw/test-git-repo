@@ -59,7 +59,7 @@ def current_branch():
         r = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, timeout=30)
     except subprocess.TimeoutExpired:
         r = None
-    ref = r.stdout.strip() if r else ""
+    ref = r.stdout.strip() if r and r.returncode == 0 else ""
     if ref and ref != "HEAD":
         return ref
     for env in ("GIT_BRANCH", "BRANCH_NAME"):
@@ -116,17 +116,19 @@ BINARY_RE = re.compile(r"^(?:GIT binary patch|Binary files .+ differ)$", re.M)
 
 
 def sh(args):
+    """返回命令输出：空串为成功但无输出，None 为超时失败（调用方需区分）。"""
     try:
         return subprocess.run(args, capture_output=True, text=True, timeout=60).stdout.strip()
     except subprocess.TimeoutExpired:
         print("警告: git 命令超时(60s): %s" % " ".join(args))
-        return ""
+        return None
 
 
 def rev_parse(rev):
     try:
         r = subprocess.run(["git", "rev-parse", "--verify", rev + "^{commit}"], capture_output=True, text=True, timeout=30)
     except subprocess.TimeoutExpired:
+        print("警告: git rev-parse 超时(30s): %s" % rev)
         return ""
     return r.stdout.strip() if r.returncode == 0 else ""
 
@@ -135,6 +137,7 @@ def merge_base(a, b):
     try:
         r = subprocess.run(["git", "merge-base", a, b], capture_output=True, text=True, timeout=30)
     except subprocess.TimeoutExpired:
+        print("警告: git merge-base 超时(30s)")
         return ""
     return r.stdout.strip() if r.returncode == 0 else ""
 
@@ -168,6 +171,8 @@ def get_review_range():
     base, source = resolve_base()
     head = rev_parse("HEAD")
     diff = sh(["git", "diff", base, head]) if head else ""
+    if diff is None:
+        return None, base, head, source  # diff 超时：无法确定审核范围
     return diff, base, head, source
 
 
@@ -274,12 +279,16 @@ def ledger_entry_from(f, head):
         line_no = 0
     if not path or path == "-" or line_no < 1 or not head:
         return None
-    try:
-        lines = file_lines_at(path, head)
-    except GitTimeout:
-        return None  # 不可判定：本轮不落账，发现仍在报告与阻断计数中
+    lines = None
+    for attempt in (1, 2):  # git show 超时多为瞬时，重试一次减少"下轮漏拦"窗口
+        try:
+            lines = file_lines_at(path, head)
+            break
+        except GitTimeout:
+            if attempt == 1:
+                time.sleep(1)
     if not lines:
-        return None
+        return None  # 重试后仍超时/文件不存在：本轮不落账，发现仍在报告与阻断计数中
     ctx, offset = context_window(lines, line_no)
     return {
         "file": path, "line": line_no, "severity": severity_of(f),
@@ -585,6 +594,8 @@ def review_chunk(rules, key, index, task):
 
 def main():
     raw_diff, base, head, base_source = get_review_range()
+    if raw_diff is None:
+        return finish_without_scan("git diff 超时，无法确定审核范围", head)
     print("AI review 分支: %s" % BRANCH)
     print("AI review 范围: %s..%s（基点: %s）" % (base[:8], head[:8] or "HEAD", base_source))
     if not raw_diff.strip():

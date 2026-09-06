@@ -32,6 +32,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -333,12 +334,13 @@ def review_chunk(rules, key, index, chunk):
     def failed(reason):
         return {"_error": reason, "_files": files, "verdict": "pass", "summary": "分片未完成审核", "findings": []}
 
-    # 调用与解析整体重试一次：LLM 偶发输出截断/流中断是瞬时的，直接判定
-    # 分片未完成会让 blocking 构建无谓失败
+    # 调用与解析整体重试（最多 3 次尝试）：LLM 偶发输出截断/流中断是瞬时的，
+    # 直接判定分片未完成会让 blocking 构建无谓失败
     result, last_reason = None, ""
-    for attempt in (1, 2):
-        if attempt == 2 and result is None:
-            print("  分片 %d: 第 1 次调用未得到可用输出，重试" % index)
+    for attempt in (1, 2, 3):
+        if attempt > 1 and result is None:
+            print("  分片 %d: 第 %d 次调用未得到可用输出，重试" % (index, attempt - 1))
+            time.sleep(2)
         try:
             with urllib.request.urlopen(req, timeout=600) as resp:
                 body = json.load(resp)
@@ -374,7 +376,7 @@ def review_chunk(rules, key, index, chunk):
             continue
         break
     if result is None:
-        return failed("%s（重试 1 次后仍失败）" % last_reason)
+        return failed("%s（重试 2 次后仍失败）" % last_reason)
     result.setdefault("verdict", "pass")
     result.setdefault("findings", [])
     result["_files"] = files

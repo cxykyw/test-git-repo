@@ -10,7 +10,7 @@ GitHub → Jenkins 手动构建（Build with Parameters 传入 BRANCH 选择分�
   → Checkout（按参数切分支）
   → 安全扫描（Semgrep×3 规则集 / Gitleaks / Trivy 并行 → scan/*.json）
   → 确定性质量门禁（gate.sh → scan/gate.json）
-  → Dify AI 分片并行审核（ai_review.py → scan/ai.json）
+  → Dify AI 文件任务并行审核（ai_review.py → scan/ai.json）
   → make_report.py 渲染 report.html
   → build.sh 打包 zip
   → 归档：zip + report.html（仅此两项）
@@ -47,8 +47,8 @@ GitHub → Jenkins 手动构建（Build with Parameters 传入 BRANCH 选择分�
 
 - **advisory（脚本默认）**：结果只展示不阻断
 - **DIFY_BLOCKING=1（Jenkinsfile 已启用）**：仅以下情况阻断打包——
-  AI_REVIEW_BLOCK_SEVERITIES（默认 blocker,critical）级发现、未审完的分片、
-  超出分片上限未审核的文件；major 及以下仅展示
+  AI_REVIEW_BLOCK_SEVERITIES（默认 blocker,critical）级发现、未审完的任务、
+  超出任务上限未审核的文件；major 及以下仅展示
 - **遗留台账 `.ai-review-state.<分支>.json`（工作区状态，不入库）**：阻断级发现落账，
   每次构建对照 HEAD 代码逐一核对——被标记代码仍在 = 未修复（并入报告、
   继续阻断），已变更或文件删除 = 已修复（出账并在报告标注）。

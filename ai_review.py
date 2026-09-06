@@ -48,12 +48,14 @@ BLOCK_SEVERITIES = {
     for s in os.environ.get("AI_REVIEW_BLOCK_SEVERITIES", "blocker,critical").split(",")
     if s.strip()
 }
+
+
 def current_branch():
     """构建分支：优先取工作区实际签出的分支（git HEAD）；游离 HEAD 时退回
     Jenkins 注入的 GIT_BRANCH/BRANCH_NAME，再不行用短 SHA。
     不先信任 GIT_BRANCH——它反映任务 SCM 配置的分支，而构建参数可在
     Checkout 阶段切到别的分支。"""
-    r = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True)
+    r = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True, timeout=30)
     ref = r.stdout.strip()
     if ref and ref != "HEAD":
         return ref
@@ -61,7 +63,7 @@ def current_branch():
         v = os.environ.get(env, "").strip()
         if v:
             return v[len("origin/"):] if v.startswith("origin/") else v
-    r = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True)
+    r = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=30)
     return r.stdout.strip() or "unknown"
 
 
@@ -78,7 +80,10 @@ def _int_env(*names, default):
     for name in names:
         v = os.environ.get(name, "").strip()
         if v:
-            return int(v)
+            try:
+                return int(v)
+            except ValueError:
+                print("警告: 环境变量 %s=%r 不是整数，使用默认值 %s" % (name, v, default))
     return default
 
 
@@ -105,16 +110,16 @@ BINARY_RE = re.compile(r"^(?:GIT binary patch|Binary files .+ differ)$", re.M)
 
 
 def sh(args):
-    return subprocess.run(args, capture_output=True, text=True).stdout.strip()
+    return subprocess.run(args, capture_output=True, text=True, timeout=60).stdout.strip()
 
 
 def rev_parse(rev):
-    r = subprocess.run(["git", "rev-parse", "--verify", rev + "^{commit}"], capture_output=True, text=True)
+    r = subprocess.run(["git", "rev-parse", "--verify", rev + "^{commit}"], capture_output=True, text=True, timeout=30)
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
 def merge_base(a, b):
-    r = subprocess.run(["git", "merge-base", a, b], capture_output=True, text=True)
+    r = subprocess.run(["git", "merge-base", a, b], capture_output=True, text=True, timeout=30)
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
@@ -187,34 +192,47 @@ def load_state():
 
 
 def save_state(entries):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+    tmp = STATE_FILE + ".tmp"  # 原子写：中断不会损坏台账
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"blocking_findings": entries}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STATE_FILE)
 
 
 def file_lines_at(path, head):
-    r = subprocess.run(["git", "show", "%s:%s" % (head, path)], capture_output=True)
+    try:
+        r = subprocess.run(["git", "show", "%s:%s" % (head, path)], capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return None
     if r.returncode != 0:
         return None
     return r.stdout.decode("utf-8", "replace").splitlines()
 
 
 def context_window(lines, line_no):
-    """标记行及其前后各一行的指纹（rstrip 对齐），越界收缩；返回 (窗口, 标记行偏移)。"""
-    i = max(0, min(line_no - 1, len(lines) - 1))
-    lo, hi = max(0, i - 1), min(len(lines), i + 2)
-    return [l.rstrip() for l in lines[lo:hi]], i - lo
+    """标记行及其前后各一行的指纹（rstrip 对齐）；文件边缘时平移窗口保持 3 行，
+    避免指纹缩成 1-2 行造成误匹配；返回 (窗口, 标记行偏移)。"""
+    radius = 1
+    if len(lines) < 2 * radius + 1:
+        return [l.rstrip() for l in lines], line_no - 1
+    i = min(max(line_no - 1, radius), len(lines) - 1 - radius)
+    lo, hi = i - radius, i + radius + 1
+    return [l.rstrip() for l in lines[lo:hi]], (line_no - 1) - lo
 
 
-def find_context(lines, ctx, offset):
-    """在文件行里滑动窗口精确匹配指纹，命中返回标记行号（1-based），未命中 None。"""
+def find_context(lines, ctx, offset, near=None):
+    """滑动窗口精确匹配指纹，命中返回标记行号（1-based），未命中 None；
+    多处命中时取最接近上次记录行号（near）的，避免重复代码块错位。"""
     n = len(ctx)
     if not lines or n == 0 or len(lines) < n:
         return None
     offset = max(0, min(offset, n - 1))
-    for i in range(len(lines) - n + 1):
-        if all(lines[i + k].rstrip() == ctx[k] for k in range(n)):
-            return i + offset + 1
-    return None
+    matches = [i for i in range(len(lines) - n + 1)
+               if all(lines[i + k].rstrip() == ctx[k] for k in range(n))]
+    if not matches:
+        return None
+    if near is None:
+        return matches[0] + offset + 1
+    return min((i + offset + 1 for i in matches), key=lambda ln: abs(ln - near))
 
 
 def ledger_entry_from(f, head):
@@ -256,7 +274,7 @@ def recheck_ledger(entries, head):
         path = str(e.get("file") or "")
         if path not in contents:
             contents[path] = file_lines_at(path, head)
-        at = find_context(contents[path], e.get("context") or [], int(e.get("ctx_offset", 0) or 0))
+        at = find_context(contents[path], e.get("context") or [], int(e.get("ctx_offset", 0) or 0), near=e.get("line"))
         if at:
             still.append(dict(e, line=at, last_seen_commit=head[:8]))
         else:
@@ -478,7 +496,7 @@ def review_chunk(rules, key, index, task):
     for attempt in (1, 2, 3):
         if attempt > 1 and result is None:
             print("  任务 %d: 第 %d 次调用未得到可用输出，重试" % (index, attempt - 1))
-            time.sleep(2)
+            time.sleep(2 * (attempt - 1))
         try:
             with urllib.request.urlopen(req, timeout=600) as resp:
                 body = json.load(resp)
@@ -686,9 +704,9 @@ def main():
                 len(hard_findings), "/".join(sorted(BLOCK_SEVERITIES)),
                 "（含 %d 条历史遗留未修复）" % len(carried) if carried else ""))
         if unreviewed:
-            blocking_reasons.append("%d 个分片未完成审核" % len(unreviewed))
+            blocking_reasons.append("%d 个任务未完成审核" % len(unreviewed))
         if overflow_files:
-            blocking_reasons.append("%d 个文件超出分片上限未审核" % len(overflow_files))
+            blocking_reasons.append("%d 个文件超出任务上限未审核" % len(overflow_files))
         if blocking_reasons:
             print("AI review: blocking mode -> failing build (%s)" % "; ".join(blocking_reasons))
             return 1

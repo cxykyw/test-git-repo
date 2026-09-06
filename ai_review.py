@@ -284,10 +284,13 @@ def ledger_entry_from(f, head):
         try:
             lines = file_lines_at(path, head)
             break
-        except GitTimeout:
+        except GitTimeout as e:
+            print("警告: 落账读取 %s 超时(第 %d 次): %s" % (path, attempt, e))
             if attempt == 1:
                 time.sleep(1)
     if not lines:
+        # 重试后仍超时（不可判定）与文件不存在（确认缺失）在此都归为不落账：
+        # 两者对"本轮发现是否入库"的处理一致，都不会产生误判已修复
         return None  # 重试后仍超时/文件不存在：本轮不落账，发现仍在报告与阻断计数中
     ctx, offset = context_window(lines, line_no)
     return {

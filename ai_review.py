@@ -46,16 +46,18 @@ BLOCK_SEVERITIES = {
     if s.strip()
 }
 def current_branch():
-    """构建分支：Jenkins 注入的 GIT_BRANCH/BRANCH_NAME 优先，其次本地 HEAD；
-    游离 HEAD（按提交签出）退回短 SHA。"""
-    for env in ("GIT_BRANCH", "BRANCH_NAME"):
-        v = os.environ.get(env, "").strip()
-        if v:
-            return v[len("origin/"):] if v.startswith("origin/") else v
+    """构建分支：优先取工作区实际签出的分支（git HEAD）；游离 HEAD 时退回
+    Jenkins 注入的 GIT_BRANCH/BRANCH_NAME，再不行用短 SHA。
+    不先信任 GIT_BRANCH——它反映任务 SCM 配置的分支，而构建参数可在
+    Checkout 阶段切到别的分支。"""
     r = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True)
     ref = r.stdout.strip()
     if ref and ref != "HEAD":
         return ref
+    for env in ("GIT_BRANCH", "BRANCH_NAME"):
+        v = os.environ.get(env, "").strip()
+        if v:
+            return v[len("origin/"):] if v.startswith("origin/") else v
     r = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True)
     return r.stdout.strip() or "unknown"
 
@@ -331,19 +333,27 @@ def review_chunk(rules, key, index, chunk):
     def failed(reason):
         return {"_error": reason, "_files": files, "verdict": "pass", "summary": "分片未完成审核", "findings": []}
 
-    try:
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            body = json.load(resp)
-    except Exception as e:
-        return failed("Dify 调用失败: %s" % e)
-    data = body.get("data") or {}
-    if data.get("status") != "succeeded":
-        return failed("工作流状态 %s: %s" % (data.get("status"), str(data.get("error"))[:200]))
-    out = data.get("outputs") or {}
-    raw = out.get("review") or out.get("text") or ""
-    if isinstance(raw, dict):
-        result = raw
-    else:
+    # 调用与解析整体重试一次：LLM 偶发输出截断/流中断是瞬时的，直接判定
+    # 分片未完成会让 blocking 构建无谓失败
+    result, last_reason = None, ""
+    for attempt in (1, 2):
+        if attempt == 2 and result is None:
+            print("  分片 %d: 第 1 次调用未得到可用输出，重试" % index)
+        try:
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                body = json.load(resp)
+        except Exception as e:
+            last_reason = "Dify 调用失败: %s" % e
+            continue
+        data = body.get("data") or {}
+        if data.get("status") != "succeeded":
+            last_reason = "工作流状态 %s: %s" % (data.get("status"), str(data.get("error"))[:200])
+            continue
+        out = data.get("outputs") or {}
+        raw = out.get("review") or out.get("text") or ""
+        if isinstance(raw, dict):
+            result = raw
+            break
         raw = str(raw).strip()
         if raw.startswith("```"):
             raw = raw.strip("`").strip()
@@ -356,9 +366,15 @@ def review_chunk(rules, key, index, chunk):
             try:
                 result = json.loads(raw, strict=False)
             except Exception as e:
-                return failed("模型输出解析失败: %s (%s)" % (e, raw[:200]))
-    if not isinstance(result, dict):
-        return failed("模型输出非 JSON 对象（类型 %s）: %s" % (type(result).__name__, str(result)[:200]))
+                last_reason = "模型输出解析失败: %s (%s)" % (e, raw[:200])
+                continue
+        if not isinstance(result, dict):
+            last_reason = "模型输出非 JSON 对象（类型 %s）: %s" % (type(result).__name__, str(result)[:200])
+            result = None
+            continue
+        break
+    if result is None:
+        return failed("%s（重试 1 次后仍失败）" % last_reason)
     result.setdefault("verdict", "pass")
     result.setdefault("findings", [])
     result["_files"] = files

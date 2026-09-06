@@ -75,6 +75,8 @@ workflow:
           model:
             completion_params:
               temperature: 0
+              # 显式给足输出预算：截断的 JSON 会导致分片审核失败
+              max_tokens: 8192
             mode: chat
             name: Doubao-Seed-2.1-turbo
             provider: langgenius/openai_api_compatible/openai_api_compatible
@@ -88,6 +90,7 @@ workflow:
                 只输出一个 JSON 对象，禁止输出 JSON 以外的任何字符（包括 Markdown 代码块标记）：
                 {"verdict": "pass|fail", "summary": "一句话总结", "findings": [{"file": "路径", "line": 行号, "severity": "blocker|major|minor|info", "message": "问题描述", "suggestion": "修复建议"}]}
                 verdict 判定: 存在 blocker 或 major 即 fail；否则 pass。没有发现时 findings 为空数组。
+                长度约束: findings 最多 20 条，每条 message 与 suggestion 不超过 60 字，summary 不超过 40 字，超出的按严重级别取舍。
                 findings 元素的字段名必须精确使用: file, line, severity, message, suggestion，禁止使用其他字段名。
 
                 ## 审查规则
@@ -97,6 +100,7 @@ workflow:
                 只输出一个 JSON 对象，禁止输出 JSON 以外的任何字符（包括 Markdown 代码块标记）：
                 {"verdict": "pass|fail", "summary": "一句话总结", "findings": [{"file": "路径", "line": 行号, "severity": "blocker|major|minor|info", "message": "问题描述", "suggestion": "修复建议"}]}
                 verdict 判定: 存在 blocker 或 major 即 fail；否则 pass。没有发现时 findings 为空数组。
+                长度约束: findings 最多 20 条，每条 message 与 suggestion 不超过 60 字，summary 不超过 40 字，超出的按严重级别取舍。
                 findings 元素的字段名必须精确使用: file, line, severity, message, suggestion，禁止使用其他字段名。
             - id: prompt-user
               role: user

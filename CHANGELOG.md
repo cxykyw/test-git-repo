@@ -2,6 +2,9 @@
 
 ## 2026-09-06
 
+- fix: 分片审核"调用+解析"整体自动重试一次——LLM 偶发输出截断（实测同一输入重放即完整，温度 0 亦有流式抖动）不再直接把分片判为未完成审核而阻断构建；重试仍失败才落"未完成"并按 blocking 语义拦截
+- fix: 分支识别优先取工作区实际签出的 HEAD 分支——Jenkins 注入的 GIT_BRANCH 反映任务 SCM 配置的分支而非构建参数所选分支，原优先级会使按分支隔离失效（首次真实构建中由 AI 审核发现并确认）
+- chore: Dify LLM 节点显式 max_tokens=8192，提示词增加输出长度约束（findings ≤20 条、单条 ≤60 字）；需在 Dify 控制台重新导入 ai-review/dify-dsl.yml 覆盖应用并发布后生效
 - feat: **构建分支参数**——Jenkins 构建时传入 `BRANCH` 选择要构建/审核的分支（默认 main，白名单校验防注入，Checkout 阶段按参数切分支）；审核基点与遗留台账按分支独立存储（`.ai-review-base.<分支>` / `.ai-review-state.<分支>.json`），切换分支互不串扰，旧版无后缀 `.ai-review-base` 自动迁移
 - fix: 无新增 diff 的空重建不再绕过遗留台账——未修复的阻断级发现继续阻断
 - feat: **按严重级别阻断启用**——Jenkinsfile 设 `DIFY_BLOCKING=1`，blocker/critical 级发现（`AI_REVIEW_BLOCK_SEVERITIES` 可调）、未审完分片、超限未审文件使构建失败，打包阶段不执行

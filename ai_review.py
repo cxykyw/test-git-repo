@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """AI code review bridge: git diff -> Dify workflow (chunked, parallel) -> merged verdict.
 
-Large diffs are split at file boundaries into chunks under a char budget,
-reviewed in parallel, then merged deterministically. Advisory by default.
+Changed files are grouped into fixed-budget review tasks (per task: the
+file's diff, surrounding context from HEAD and scanner hints; oversized
+files are further split by hunk groups), reviewed in parallel, then merged
+deterministically. Per-call input is bounded regardless of change size. Advisory by default.
 With DIFY_BLOCKING=1 the build fails only on blocker/critical-severity
 findings (AI_REVIEW_BLOCK_SEVERITIES overrides the set) or when a chunk
 could not be reviewed or files overflowed the chunk limit; major and below
@@ -72,10 +74,23 @@ BASE_MARKER = os.path.join(SCRIPT_DIR, ".ai-review-base." + BRANCH_KEY)
 STATE_FILE = os.path.join(SCRIPT_DIR, ".ai-review-state." + BRANCH_KEY + ".json")
 LEGACY_BASE_MARKER = os.path.join(SCRIPT_DIR, ".ai-review-base")
 
-CHUNK_CHAR_BUDGET = int(os.environ.get("AI_REVIEW_CHUNK_CHARS", "100000"))
-FILE_LINE_CAP = int(os.environ.get("AI_REVIEW_FILE_LINES", "800"))
-MAX_CHUNKS = int(os.environ.get("AI_REVIEW_MAX_CHUNKS", "40"))
-MAX_WORKERS = int(os.environ.get("AI_REVIEW_WORKERS", "3"))
+def _int_env(*names, default):
+    for name in names:
+        v = os.environ.get(name, "").strip()
+        if v:
+            return int(v)
+    return default
+
+
+# 每个审核任务的输入预算（字符）：diff+上下文+线索合计的常数上界，与变更总量无关；
+# AI_REVIEW_CHUNK_CHARS 为旧环境变量名，继续兼容
+TASK_BUDGET = _int_env("AI_REVIEW_TASK_BUDGET", "AI_REVIEW_CHUNK_CHARS", default=12000)
+FILE_LINE_CAP = _int_env("AI_REVIEW_FILE_LINES", default=800)
+CONTEXT_LINES = _int_env("AI_REVIEW_CONTEXT_LINES", default=40)
+CONTEXT_BUDGET = _int_env("AI_REVIEW_CONTEXT_CHARS", default=4000)
+HINTS_BUDGET = _int_env("AI_REVIEW_HINTS_CHARS", default=800)
+MAX_CHUNKS = _int_env("AI_REVIEW_MAX_TASKS", "AI_REVIEW_MAX_CHUNKS", default=40)
+MAX_WORKERS = _int_env("AI_REVIEW_WORKERS", default=6)
 SKIP_RE = re.compile(
     r"(^|/)(package-lock\.json|.*\.lock)$"
     r"|^(dist|build|vendor|target)(/|$)"
@@ -146,15 +161,11 @@ def file_path_of(patch):
 
 
 def cap_patch(patch):
+    """行数兜底截断；字符体量由任务预算 + hunk 拆分负责。"""
     truncated = False
     lines = patch.splitlines()
     if len(lines) > FILE_LINE_CAP:
         patch = "\n".join(lines[:FILE_LINE_CAP])
-        truncated = True
-    char_cap = max(CHUNK_CHAR_BUDGET - 4000, 2000)
-    if len(patch) > char_cap:
-        cut = patch.rfind("\n", 0, char_cap)
-        patch = patch[: cut if cut > 0 else char_cap]
         truncated = True
     if truncated:
         patch += "\n... (该文件 diff 超长，已截断)"
@@ -265,17 +276,144 @@ def carried_copy(e):
     }
 
 
-def build_chunks(files):
-    chunks, current, size = [], [], 0
-    for item in files:
-        if current and size + len(item[1]) > CHUNK_CHAR_BUDGET:
-            chunks.append(current)
-            current, size = [], 0
-        current.append(item)
-        size += len(item[1])
-    if current:
-        chunks.append(current)
-    return chunks
+HUNK_HEAD_RE = re.compile(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+
+def split_patch_hunks(patch):
+    """按 hunk 切分 patch，返回 (header, [hunk_text, ...])。"""
+    header, hunks, cur = [], [], None
+    for line in patch.splitlines(keepends=True):
+        if line.startswith("@@"):
+            if cur:
+                hunks.append("".join(cur))
+            cur = [line]
+        elif cur is not None:
+            cur.append(line)
+        else:
+            header.append(line)
+    if cur:
+        hunks.append("".join(cur))
+    return "".join(header), hunks
+
+
+def file_context(path, patch, head):
+    """变更 hunk 在 HEAD 文件上的周边代码窗口（默认 ±40 行，多 hunk 区间合并，
+    行号即文件真实行号）；新文件或 HEAD 读不到时回退为 diff 的新增行。
+    超出 CONTEXT_BUDGET 截断。"""
+    _, hunks = split_patch_hunks(patch)
+    ranges = []
+    for h in hunks:
+        m = HUNK_HEAD_RE.match(h)
+        start = int(m.group(1)) if m else 1
+        count = int(m.group(2) or "1") if m else 1
+        end = start + max(count, 1) - 1
+        if ranges and start <= ranges[-1][1] + 1:
+            ranges[-1][1] = max(ranges[-1][1], end)
+        else:
+            ranges.append([start, end])
+    lines = file_lines_at(path, head)
+    if lines:
+        segs = []
+        for start, end in ranges:
+            lo, hi = max(1, start - CONTEXT_LINES), min(len(lines), end + CONTEXT_LINES)
+            segs.append("[上下文 %s HEAD 第 %d-%d 行]\n%s" % (
+                path, lo, hi,
+                "\n".join("%5d| %s" % (i, lines[i - 1]) for i in range(lo, hi + 1))))
+        text = "\n".join(segs)
+    else:
+        added = "\n".join(l[1:] for l in patch.splitlines()
+                          if l.startswith("+") and not l.startswith("+++"))
+        text = "[上下文 %s（新文件，取 diff 新增行）]\n%s" % (path, added)
+    if len(text) > CONTEXT_BUDGET:
+        text = text[:CONTEXT_BUDGET] + "\n... (上下文超预算，已截断)"
+    return text
+
+
+def load_hints_by_file():
+    """scan/semgrep.json -> {path: 线索文本}；报告缺失或损坏时返回空。"""
+    try:
+        with open("scan/semgrep.json", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    hits = {}
+    for r in data.get("results", []) if isinstance(data, dict) else []:
+        path = r.get("path")
+        if not path:
+            continue
+        extra = r.get("extra") or {}
+        hits.setdefault(path, []).append("- [%s] %s:%s %s (%s)" % (
+            extra.get("severity", "?"), path, (r.get("start") or {}).get("line", 0),
+            str(extra.get("message", ""))[:100], r.get("check_id", "?")))
+    return {p: "\n".join(v)[:HINTS_BUDGET] for p, v in hits.items()}
+
+
+def file_section(path, patch, ctx, hints):
+    sec = "== 文件: %s ==\n[变更 diff]\n%s" % (path, patch)
+    if ctx:
+        sec += "\n\n" + ctx
+    if hints:
+        sec += "\n\n[静态扫描线索]\n%s" % hints
+    return sec
+
+
+def build_material_items(path, patch, truncated, head, hints):
+    """一个文件 -> 一个或多个任务项（超预算时按 hunk 组拆段、单 hunk 再按行切），
+    保证每项 section 的长度 ≤ TASK_BUDGET。"""
+    ctx = file_context(path, patch, head)
+    hint = hints.get(path, "")
+    fixed = len(file_section(path, "", ctx, hint))
+    budget = max(TASK_BUDGET - fixed, 500)
+    if len(patch) <= budget:
+        section = file_section(path, patch, ctx, hint)
+        return [{"path": path, "section": section, "truncated": truncated, "size": len(section)}]
+
+    header, hunks = split_patch_hunks(patch)
+    units = []
+    for h in hunks or [patch]:
+        if len(h) <= budget:
+            units.append(h)
+            continue
+        cur, size = [], 0  # 单 hunk 仍超预算：按行切
+        for ln in h.splitlines(keepends=True):
+            if cur and size + len(ln) > budget:
+                units.append("".join(cur))
+                cur, size = [], 0
+            cur.append(ln)
+            size += len(ln)
+        if cur:
+            units.append("".join(cur))
+    groups, cur, size = [], [], 0
+    for u in units:
+        if cur and size + len(u) > budget:
+            groups.append("".join(cur))
+            cur, size = [], 0
+        cur.append(u)
+        size += len(u)
+    if cur:
+        groups.append("".join(cur))
+
+    items = []
+    total = len(groups)
+    for i, grp in enumerate(groups, 1):
+        note = "" if total == 1 else "\n[说明] 该文件 diff 过长，本任务仅包含第 %d/%d 段 hunks" % (i, total)
+        section = file_section(path, header + grp, ctx if i == 1 else "", hint if i == 1 else "") + note
+        items.append({"path": path, "section": section, "truncated": truncated, "size": 0})
+    for it in items:
+        it["size"] = len(it["section"])
+    return items
+
+
+def build_tasks(items):
+    """贪心装箱：相邻任务项在预算内合并成一个任务，减少调用次数。"""
+    tasks = []
+    for it in items:
+        if tasks and tasks[-1]["size"] + it["size"] <= TASK_BUDGET:
+            tasks[-1]["items"].append(it)
+            tasks[-1]["size"] += it["size"]
+        else:
+            tasks.append({"items": [it], "size": it["size"]})
+    return tasks
 
 
 def read_text(path):
@@ -317,8 +455,8 @@ def finish_without_scan(reason, head, extra_meta=None):
     return 0
 
 
-def review_chunk(rules, key, index, chunk):
-    diff_text = "\n".join(p for _, p, _ in chunk)
+def review_chunk(rules, key, index, task):
+    diff_text = "\n\n".join(it["section"] for it in task["items"])
     payload = json.dumps({
         "inputs": {"diff": diff_text, "rules": rules},
         "response_mode": "blocking",
@@ -329,17 +467,17 @@ def review_chunk(rules, key, index, chunk):
         data=payload,
         headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
     )
-    files = [p for p, _, _ in chunk]
+    files = list(dict.fromkeys(it["path"] for it in task["items"]))
 
     def failed(reason):
-        return {"_error": reason, "_files": files, "verdict": "pass", "summary": "分片未完成审核", "findings": []}
+        return {"_error": reason, "_files": files, "verdict": "pass", "summary": "任务未完成审核", "findings": []}
 
     # 调用与解析整体重试（最多 3 次尝试）：LLM 偶发输出截断/流中断是瞬时的，
-    # 直接判定分片未完成会让 blocking 构建无谓失败
+    # 直接判定任务未完成会让 blocking 构建无谓失败
     result, last_reason = None, ""
     for attempt in (1, 2, 3):
         if attempt > 1 and result is None:
-            print("  分片 %d: 第 %d 次调用未得到可用输出，重试" % (index, attempt - 1))
+            print("  任务 %d: 第 %d 次调用未得到可用输出，重试" % (index, attempt - 1))
             time.sleep(2)
         try:
             with urllib.request.urlopen(req, timeout=600) as resp:
@@ -411,10 +549,15 @@ def main():
         return finish_without_scan("全部文件在审查范围外", head,
                                    {"skipped": [{"file": p, "reason": r} for p, r in skipped.items()]})
 
-    chunks = build_chunks(files)
+    hints = load_hints_by_file()
+    items = []
+    for path, patch, t in files:
+        items.extend(build_material_items(path, patch, t, head, hints))
+    chunks = build_tasks(items)
     overflow_files = []
     if len(chunks) > MAX_CHUNKS:
-        overflow_files = [p for c in chunks[MAX_CHUNKS:] for p, _, _ in c]
+        overflow_files = list(dict.fromkeys(
+            it["path"] for c in chunks[MAX_CHUNKS:] for it in c["items"]))
         chunks = chunks[:MAX_CHUNKS]
 
     rules = read_text(RULES)
@@ -424,7 +567,8 @@ def main():
         save_ai_result({"verdict": "skipped", "reason": "未配置 Dify API key", "skipped": skipped})
         return 0
 
-    print("AI review: %d 个文件 -> %d 个分片（并行 %d）" % (len(files), len(chunks), MAX_WORKERS))
+    print("AI review: %d 个文件 -> %d 个任务（并行 %d，单任务预算 %d 字符）" % (
+        len(files), len(chunks), MAX_WORKERS, TASK_BUDGET))
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = {ex.submit(review_chunk, rules, key, i, c): (i, c) for i, c in enumerate(chunks, 1)}
@@ -433,11 +577,11 @@ def main():
             r = fut.result()
             r["_index"] = i
             results.append(r)
-            names = ",".join(p for p, _, _ in c)[:70]
+            names = ",".join(dict.fromkeys(it["path"] for it in c["items"]))[:70]
             if r.get("_error"):
-                print("  分片 %d/%d (%s): 未完成 - %s" % (i, len(chunks), names, r["_error"]))
+                print("  任务 %d/%d (%s): 未完成 - %s" % (i, len(chunks), names, r["_error"]))
             else:
-                print("  分片 %d/%d (%s): %s (%d findings)" % (i, len(chunks), names, r.get("verdict"), len(r.get("findings", []))))
+                print("  任务 %d/%d (%s): %s (%d findings)" % (i, len(chunks), names, r.get("verdict"), len(r.get("findings", []))))
     results.sort(key=lambda r: r["_index"])
 
     findings, seen = [], set()
@@ -452,14 +596,14 @@ def main():
     if unreviewed:
         findings.append({
             "file": "-", "line": 0, "severity": "major",
-            "message": "%d 个分片未能完成 AI 审核: %s" % (len(unreviewed), "; ".join(r["_error"] for r in unreviewed)[:200]),
+            "message": "%d 个任务未能完成 AI 审核: %s" % (len(unreviewed), "; ".join(r["_error"] for r in unreviewed)[:200]),
             "suggestion": "检查 Dify 服务后重新触发构建",
         })
     if overflow_files:
         findings.append({
             "file": "-", "line": 0, "severity": "major",
-            "message": "%d 个文件超出分片上限未审核: %s" % (len(overflow_files), ", ".join(overflow_files[:5])),
-            "suggestion": "提高 AI_REVIEW_MAX_CHUNKS 或拆分提交",
+            "message": "%d 个文件超出任务上限未审核: %s" % (len(overflow_files), ", ".join(overflow_files[:5])),
+            "suggestion": "提高 AI_REVIEW_MAX_TASKS 或拆分提交",
         })
     truncated = [p for p, _, t in files if t]
 
@@ -496,10 +640,10 @@ def main():
 
     result = {
         "verdict": verdict,
-        "summary": "%d 个文件 / %d 个分片: %d 条发现%s%s%s%s%s" % (
+        "summary": "%d 个文件 / %d 个任务: %d 条发现%s%s%s%s%s" % (
             len(files), len(results), len(findings),
-            "，%d 个分片未完成审核" % len(unreviewed) if unreviewed else "",
-            "，%d 个文件超出分片上限" % len(overflow_files) if overflow_files else "",
+            "，%d 个任务未完成审核" % len(unreviewed) if unreviewed else "",
+            "，%d 个文件超出任务上限" % len(overflow_files) if overflow_files else "",
             "，%d 个文件超长截断" % len(truncated) if truncated else "",
             "，%d 条遗留发现未修复" % len(carried) if carried else "",
             "，%d 条遗留发现已修复" % len(resolved) if resolved else "",
@@ -525,7 +669,7 @@ def main():
         "findings": findings,
         "meta": result["meta"],
     })
-    # 基点只在整段范围都审完时推进：有分片未审完或文件超分片上限时，
+    # 基点只在整段范围都审完时推进：有任务未审完或文件超任务上限时，
     # 下次构建仍从旧基点重审，避免漏审
     if not overflow_files and not unreviewed and head:
         with open(BASE_MARKER, "w") as f:

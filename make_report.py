@@ -111,7 +111,7 @@ def ai_section(ai):
     meta = ai.get("meta") or {}
     notes = []
     if meta.get("unreviewed_chunks"):
-        notes.append("%s 个分片未完成审核" % meta["unreviewed_chunks"])
+        notes.append("%s 个任务未完成审核" % meta["unreviewed_chunks"])
     if meta.get("overflow_files"):
         notes.append("%s 个文件超出分片上限未审核" % len(meta["overflow_files"]))
     if meta.get("truncated_files"):

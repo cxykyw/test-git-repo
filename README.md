@@ -28,7 +28,7 @@ GitHub → Jenkins 手动构建（Build with Parameters 传入 BRANCH 选择分�
 |---|---|
 | `Jenkinsfile` | 流水线定义；buildDiscarder 只保留 10 次构建/5 份产物 |
 | `gate.sh` | 确定性门禁：gitleaks 密钥 / semgrep ERROR / trivy CRITICAL 任一命中即 FAIL |
-| `ai_review.py` | AI 审核：累计基点取 diff → 按文件分片并行送审 → 聚合去重 → 遗留台账核对修复状态 → 写 scan/ai.json |
+| `ai_review.py` | AI 审核：累计基点取 diff → 文件任务化（diff+上下文+扫描线索，固定预算）→ 并行送审 → 聚合去重 → 遗留台账核对修复状态 → 写 scan/ai.json |
 | `make_report.py` | 把 scan/gate.json + scan/ai.json 渲染成 report.html（post always 阶段执行，门禁失败也有报告） |
 | `build.sh` | 打包最终 zip |
 | `ai-review/rules.md` | 审查规则（规则即代码：随代码版本走，改动走 MR） |
@@ -59,12 +59,18 @@ GitHub → Jenkins 手动构建（Build with Parameters 传入 BRANCH 选择分�
 
 ## 大 diff 与累计审核基点
 
-- diff 按文件切分片（默认 100K 字符/片）并行送审，结果聚合去重
+- **文件任务模型**：审核单元是固定预算的"文件任务"（默认 12K 字符）——每任务包含
+  该文件的 diff、HEAD 上的周边上下文（±40 行窗口、单文件 4K 预算、多 hunk 区间
+  合并、行号即真实行号）、该文件的 semgrep 命中线索（≤800 字符）；
+  **单次调用输入恒定 ≤ 预算，与变更总量无关**
+- 单文件超预算时按 hunk 组拆成多段（单 hunk 再按行切），段间去重靠聚合阶段；
+  相邻小文件自动合并成一个任务，减少调用次数
+- 任务并行送审（默认 6 并发），结果聚合去重
 - 自动跳过并记录：lock/构建产物目录/generated 目录/_pb2/.min.js/二进制/纯删除文件
-- 单文件超 800 行或分片字符预算时截断并标注；超出分片上限的文件标记为未审核
-- 基点与台账按分支独立：`.ai-review-base.<分支>` 记录该分支上次完整审核的 HEAD，
-  多次提交攒一次构建审、不漏审；只有整段范围审完才推进基点，否则下次从旧基点
-  重审；旧版无后缀 `.ai-review-base` 在分支首次构建时自动迁移
+- 单文件 diff 超 800 行截断并标注；超出任务上限的文件标记为未审核
+- `.ai-review-base.<分支>` 记录该分支上次完整审核的 HEAD：多次提交攒一次构建审、
+  不漏审；只有整段范围审完才推进基点，否则下次从旧基点重审；
+  旧版无后缀 `.ai-review-base` 在分支首次构建时自动迁移
 - 分支由构建参数 `BRANCH` 传入（Jenkinsfile Checkout 阶段按参数切分支）
 
 ## 可调参数（Jenkins 环境变量）
@@ -73,10 +79,13 @@ GitHub → Jenkins 手动构建（Build with Parameters 传入 BRANCH 选择分�
 |---|---|---|
 | DIFY_BLOCKING | 脚本未设；Jenkinsfile 已设 1 | 设为 1 开启 AI 阻断 |
 | AI_REVIEW_BLOCK_SEVERITIES | blocker,critical | 阻断级严重级别 |
-| AI_REVIEW_CHUNK_CHARS | 100000 | 单分片字符预算 |
+| AI_REVIEW_TASK_BUDGET | 12000 | 单个审核任务输入预算（字符），兼容旧名 AI_REVIEW_CHUNK_CHARS |
+| AI_REVIEW_CONTEXT_LINES | 40 | 上下文窗口：变更 hunk 前后各取的行数 |
+| AI_REVIEW_CONTEXT_CHARS | 4000 | 单文件上下文预算（字符） |
+| AI_REVIEW_HINTS_CHARS | 800 | 单文件 semgrep 线索预算（字符） |
 | AI_REVIEW_FILE_LINES | 800 | 单文件 diff 行数上限 |
-| AI_REVIEW_MAX_CHUNKS | 40 | 分片上限，超出部分标记未审核 |
-| AI_REVIEW_WORKERS | 3 | 并行审核线程数 |
+| AI_REVIEW_MAX_TASKS | 40 | 任务上限，超出部分标记未审核（兼容旧名 AI_REVIEW_MAX_CHUNKS） |
+| AI_REVIEW_WORKERS | 6 | 并行审核线程数 |
 | DIFY_URL | http://localhost:80 | Dify 地址 |
 
 ## 本机依赖

@@ -2,9 +2,12 @@
 
 ## 2026-09-06
 
-- fix: 分片审核"调用+解析"整体自动重试（最多 3 次尝试，带退避）——LLM 链路间歇性流截断（实测同一输入时好时坏，Dify 日志见 node_llm ABORT: Failed to parse structured output）不再一击就把分片判为未完成审核而阻断构建；重试耗尽才落"未完成"并按 blocking 语义拦截
+- feat: **文件任务模型**——审核单元从"100K 字符分片"重构为固定预算的文件任务（默认 12K 字符）：diff + HEAD 上下文 + semgrep 线索合计为常数上界，**单次调用输入与变更总量无关**；单文件超预算按 hunk 组拆段（单 hunk 再按行切），相邻小文件自动合并；并行 worker 3→6
+- feat: **上下文增强**——每个任务附带变更 hunk 在 HEAD 上的周边代码窗口（±40 行、单文件 4K 预算、多 hunk 区间合并、行号即真实行号，要求发现项 line 用真实行号）；新文件回退 diff 新增行
+- feat: **semgrep 线索注入**——同一文件的静态扫描命中作为提示词线索附给模型（优先核验真伪但不局限于此），规则扫描与 AI 审核从并行无关联变为接力
+- fix: 任务审核"调用+解析"整体自动重试（最多 3 次尝试，带退避）——LLM 链路间歇性流截断（实测同一输入时好时坏，Dify 日志见 node_llm ABORT: Failed to parse structured output）不再一击就把任务判为未完成审核而阻断构建；重试耗尽才落"未完成"并按 blocking 语义拦截
 - fix: 分支识别优先取工作区实际签出的 HEAD 分支——Jenkins 注入的 GIT_BRANCH 反映任务 SCM 配置的分支而非构建参数所选分支，原优先级会使按分支隔离失效（首次真实构建中由 AI 审核发现并确认）
-- chore: Dify LLM 节点显式 max_tokens=8192，提示词增加输出长度约束（findings ≤20 条、单条 ≤60 字）；需在 Dify 控制台重新导入 ai-review/dify-dsl.yml 覆盖应用并发布后生效
+- chore: Dify LLM 节点显式 max_tokens=8192，提示词增加输出长度约束（findings ≤20 条、单条 ≤60 字）；已直接改写实例内当前工作流的 draft 与 published 版本（绕过控制台导入会新建应用的问题，改前已 pg_dump 备份），仓库 dify-dsl.yml 与线上保持同步
 - feat: **构建分支参数**——Jenkins 构建时传入 `BRANCH` 选择要构建/审核的分支（默认 main，白名单校验防注入，Checkout 阶段按参数切分支）；审核基点与遗留台账按分支独立存储（`.ai-review-base.<分支>` / `.ai-review-state.<分支>.json`），切换分支互不串扰，旧版无后缀 `.ai-review-base` 自动迁移
 - fix: 无新增 diff 的空重建不再绕过遗留台账——未修复的阻断级发现继续阻断
 - feat: **按严重级别阻断启用**——Jenkinsfile 设 `DIFY_BLOCKING=1`，blocker/critical 级发现（`AI_REVIEW_BLOCK_SEVERITIES` 可调）、未审完分片、超限未审文件使构建失败，打包阶段不执行

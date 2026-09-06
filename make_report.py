@@ -119,6 +119,11 @@ def ai_section(ai):
     if meta.get("skipped"):
         notes.append("跳过文件: %s" % "; ".join(
             "%s(%s)" % (s.get("file"), s.get("reason")) for s in meta["skipped"][:8]))
+    if meta.get("carried_findings"):
+        notes.append("%s 条历史遗留发现未修复（持续跟踪直至代码修复）" % meta["carried_findings"])
+    if meta.get("resolved_findings"):
+        detail = "; ".join(meta.get("resolved_detail") or []) or "见上次报告"
+        notes.append("%s 条历史遗留发现已修复: %s" % (meta["resolved_findings"], detail))
     note_html = ('<p class="muted">%s</p>' % html.escape("；".join(notes))) if notes else ""
     return ("<h2>AI 代码审核 %s</h2><p>%s</p><table><tr><th>严重级别</th><th>位置</th>"
             "<th>问题描述</th><th>修复建议</th></tr>%s</table>%s"

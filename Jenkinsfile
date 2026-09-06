@@ -1,13 +1,39 @@
 pipeline {
     agent any
 
+    parameters {
+        string(name: 'BRANCH', defaultValue: 'main',
+               description: '要构建与 AI 审核的分支名（origin 上的分支）')
+    }
+
     options {
         timestamps()
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '10', artifactNumToKeepStr: '5'))
     }
 
+    environment {
+        // AI 审核按严重级别阻断打包：blocker/critical 级发现、未审完分片、
+        // 超限未审文件使构建失败（AI_REVIEW_BLOCK_SEVERITIES 可调整级别集合）
+        DIFY_BLOCKING = '1'
+    }
+
     stages {
+        stage('Checkout') {
+            steps {
+                script {
+                    // 首次运行参数尚未注册时回落 main；分支名白名单校验防 shell 注入
+                    def branch = params.BRANCH ?: 'main'
+                    if (!(branch ==~ /[A-Za-z0-9._\/-]+/)) {
+                        error("非法分支名: ${branch}")
+                    }
+                    echo "构建分支: ${branch}"
+                    sh "git checkout -B '${branch}' 'origin/${branch}'"
+                    sh "git log -1 --oneline"
+                }
+            }
+        }
+
         stage('Security Scan') {
             parallel {
                 stage('Semgrep SAST') {

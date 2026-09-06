@@ -8,5 +8,6 @@ ai-review-result.json
 .DS_Store
 scan/
 report.html
-.ai-review-base
+.ai-review-base*
 __pycache__/
+.ai-review-state*

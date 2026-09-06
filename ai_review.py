@@ -6,7 +6,12 @@ reviewed in parallel, then merged deterministically. Advisory by default.
 With DIFY_BLOCKING=1 the build fails only on blocker/critical-severity
 findings (AI_REVIEW_BLOCK_SEVERITIES overrides the set) or when a chunk
 could not be reviewed or files overflowed the chunk limit; major and below
-stay display-only. Infrastructure errors degrade to a skipped review
+stay display-only. Blocking-severity findings persist per branch in
+.ai-review-state.<branch>.json (workspace-local, gitignored): each build
+re-checks them against the code at HEAD — flagged code still present means
+未修复 (re-reported and still blocking), code changed or file gone means
+已修复 (dropped from the ledger). Fix status is thus decided by code
+content, not by re-scanning the old commit. Infrastructure errors degrade to a skipped review
 (exit 0) so the deterministic gate remains the only hard blocker outside
 blocking mode.
 
@@ -14,10 +19,13 @@ Results are merged into the unified build report: this script writes the
 ai_review section to scan/ai.json (make_report.py renders report.html;
 the quality-gate section comes from gate.sh via scan/gate.json).
 
-The diff base is tracked across builds in .ai-review-base (in the job
-workspace) and advanced only after a fully reviewed run, so commits pushed
-between builds are never skipped. GIT_PREVIOUS_COMMIT /
-GIT_PREVIOUS_SUCCESSFUL_COMMIT and HEAD~1 serve as fallbacks.
+The diff base is tracked per branch across builds (.ai-review-base.<branch>
+in the job workspace; the legacy .ai-review-base is migrated on first use)
+and advanced only after a fully reviewed run, so commits pushed between
+builds are never skipped. GIT_PREVIOUS_COMMIT /
+GIT_PREVIOUS_SUCCESSFUL_COMMIT and HEAD~1 serve as fallbacks. Rebuilds with
+no new diff still re-enforce the ledger, so unfixed blocking findings keep
+failing the build until the code is actually changed.
 """
 import json
 import os
@@ -37,8 +45,29 @@ BLOCK_SEVERITIES = {
     for s in os.environ.get("AI_REVIEW_BLOCK_SEVERITIES", "blocker,critical").split(",")
     if s.strip()
 }
-RULES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai-review", "rules.md")
-BASE_MARKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ai-review-base")
+def current_branch():
+    """构建分支：Jenkins 注入的 GIT_BRANCH/BRANCH_NAME 优先，其次本地 HEAD；
+    游离 HEAD（按提交签出）退回短 SHA。"""
+    for env in ("GIT_BRANCH", "BRANCH_NAME"):
+        v = os.environ.get(env, "").strip()
+        if v:
+            return v[len("origin/"):] if v.startswith("origin/") else v
+    r = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True)
+    ref = r.stdout.strip()
+    if ref and ref != "HEAD":
+        return ref
+    r = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True)
+    return r.stdout.strip() or "unknown"
+
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BRANCH = current_branch()
+# 基点与台账按分支隔离，切换分支互不串扰；分支名做文件名安全替换
+BRANCH_KEY = re.sub(r"[^A-Za-z0-9._-]", "_", BRANCH)
+RULES = os.path.join(SCRIPT_DIR, "ai-review", "rules.md")
+BASE_MARKER = os.path.join(SCRIPT_DIR, ".ai-review-base." + BRANCH_KEY)
+STATE_FILE = os.path.join(SCRIPT_DIR, ".ai-review-state." + BRANCH_KEY + ".json")
+LEGACY_BASE_MARKER = os.path.join(SCRIPT_DIR, ".ai-review-base")
 
 CHUNK_CHAR_BUDGET = int(os.environ.get("AI_REVIEW_CHUNK_CHARS", "100000"))
 FILE_LINE_CAP = int(os.environ.get("AI_REVIEW_FILE_LINES", "800"))
@@ -52,6 +81,9 @@ SKIP_RE = re.compile(
     r"|\.min\.(js|css)$"
 )
 DIFF_SPLIT_RE = re.compile(r"(?=^diff --git )", re.M)
+# 二进制标记只认 diff 头部元信息行（@@ 之前）；在整段 patch 上做子串匹配会把
+# 本脚本源码里的字面量误当二进制标记，导致 ai_review.py 自身被跳过漏审
+BINARY_RE = re.compile(r"^(?:GIT binary patch|Binary files .+ differ)$", re.M)
 
 
 def sh(args):
@@ -77,7 +109,11 @@ def resolve_base():
     if os.path.exists(BASE_MARKER):
         marker = read_text(BASE_MARKER).strip()
         if marker:
-            candidates.append((marker, ".ai-review-base（上次已审基点）"))
+            candidates.append((marker, "%s（上次已审基点）" % os.path.basename(BASE_MARKER)))
+    elif os.path.exists(LEGACY_BASE_MARKER):
+        marker = read_text(LEGACY_BASE_MARKER).strip()
+        if marker:
+            candidates.append((marker, "旧版 .ai-review-base（迁移）"))
     for env in ("GIT_PREVIOUS_COMMIT", "GIT_PREVIOUS_SUCCESSFUL_COMMIT"):
         v = os.environ.get(env, "").strip()
         if v:
@@ -126,6 +162,106 @@ def severity_of(finding):
     return str(finding.get("severity") or "").strip().lower()
 
 
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return []
+    entries = state.get("blocking_findings") if isinstance(state, dict) else None
+    return [e for e in (entries or []) if isinstance(e, dict)]
+
+
+def save_state(entries):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"blocking_findings": entries}, f, ensure_ascii=False, indent=2)
+
+
+def file_lines_at(path, head):
+    r = subprocess.run(["git", "show", "%s:%s" % (head, path)], capture_output=True)
+    if r.returncode != 0:
+        return None
+    return r.stdout.decode("utf-8", "replace").splitlines()
+
+
+def context_window(lines, line_no):
+    """标记行及其前后各一行的指纹（rstrip 对齐），越界收缩；返回 (窗口, 标记行偏移)。"""
+    i = max(0, min(line_no - 1, len(lines) - 1))
+    lo, hi = max(0, i - 1), min(len(lines), i + 2)
+    return [l.rstrip() for l in lines[lo:hi]], i - lo
+
+
+def find_context(lines, ctx, offset):
+    """在文件行里滑动窗口精确匹配指纹，命中返回标记行号（1-based），未命中 None。"""
+    n = len(ctx)
+    if not lines or n == 0 or len(lines) < n:
+        return None
+    offset = max(0, min(offset, n - 1))
+    for i in range(len(lines) - n + 1):
+        if all(lines[i + k].rstrip() == ctx[k] for k in range(n)):
+            return i + offset + 1
+    return None
+
+
+def ledger_entry_from(f, head):
+    """阻断级发现 -> 台账条目；定位不到 HEAD 文件内容的元发现（file=-/无行号）不落账。"""
+    path = str(f.get("file") or "").strip()
+    try:
+        line_no = int(str(f.get("line", 0)).strip())
+    except ValueError:
+        line_no = 0
+    if not path or path == "-" or line_no < 1 or not head:
+        return None
+    lines = file_lines_at(path, head)
+    if not lines:
+        return None
+    ctx, offset = context_window(lines, line_no)
+    return {
+        "file": path, "line": line_no, "severity": severity_of(f),
+        "message": str(f.get("message") or ""), "suggestion": str(f.get("suggestion") or ""),
+        "context": ctx, "ctx_offset": offset,
+        "first_seen_commit": head[:8], "first_seen_build": os.environ.get("BUILD_NUMBER", "-"),
+        "last_seen_commit": head[:8],
+    }
+
+
+def same_issue(a, e):
+    if a.get("file") != e.get("file"):
+        return False
+    if a.get("context") and e.get("context") and a["context"] == e["context"]:
+        return True
+    return str(a.get("message", ""))[:60] == str(e.get("message", ""))[:60]
+
+
+def recheck_ledger(entries, head):
+    """对照 HEAD 代码核对台账：指纹仍在 = 未修复（行号刷新），已变/文件删 = 已修复。"""
+    if not head:
+        return entries, []
+    contents, still, resolved = {}, [], []
+    for e in entries:
+        path = str(e.get("file") or "")
+        if path not in contents:
+            contents[path] = file_lines_at(path, head)
+        at = find_context(contents[path], e.get("context") or [], int(e.get("ctx_offset", 0) or 0))
+        if at:
+            still.append(dict(e, line=at, last_seen_commit=head[:8]))
+        else:
+            resolved.append(e)
+    return still, resolved
+
+
+def carried_copy(e):
+    """台账条目 -> 报告发现行（标注未修复与首次发现构建号）。"""
+    seen_at = e.get("first_seen_build")
+    label = "首次发现于构建 %s" % seen_at if seen_at not in (None, "", "-") else "历史遗留"
+    return {
+        "file": e.get("file"), "line": e.get("line"), "severity": e.get("severity"),
+        "message": "%s（%s，未修复）" % (e.get("message"), label),
+        "suggestion": e.get("suggestion", ""),
+        "carried": True,
+    }
+
+
 def build_chunks(files):
     chunks, current, size = [], [], 0
     for item in files:
@@ -151,6 +287,31 @@ def save_ai_result(ai_section):
     os.makedirs('scan', exist_ok=True)
     with open('scan/ai.json', 'w') as f:
         json.dump(ai_section, f, ensure_ascii=False, indent=2)
+
+
+def finish_without_scan(reason, head, extra_meta=None):
+    """无可审 diff 时先核对遗留台账：未修复的阻断级发现继续生效（blocking 时阻断），
+    避免无新提交的空重建绕过"不修不放行"。"""
+    still_open, resolved = recheck_ledger(load_state(), head)
+    save_state(still_open)
+    meta = {"branch": BRANCH, "carried_findings": len(still_open), "resolved_findings": len(resolved)}
+    if extra_meta:
+        meta.update(extra_meta)
+    if not still_open:
+        save_ai_result({"verdict": "skipped", "reason": reason, "meta": meta})
+        print("AI review: %s (skipped)" % reason)
+        return 0
+    save_ai_result({
+        "verdict": "fail",
+        "summary": "%s；%d 条遗留发现未修复" % (reason, len(still_open)),
+        "findings": [carried_copy(e) for e in still_open],
+        "meta": meta,
+    })
+    print("AI review: %s；%d 条遗留发现未修复" % (reason, len(still_open)))
+    if BLOCKING:
+        print("AI review: blocking mode -> failing build (%d 条历史遗留未修复)" % len(still_open))
+        return 1
+    return 0
 
 
 def review_chunk(rules, key, index, chunk):
@@ -206,11 +367,10 @@ def review_chunk(rules, key, index, chunk):
 
 def main():
     raw_diff, base, head, base_source = get_review_range()
+    print("AI review 分支: %s" % BRANCH)
     print("AI review 范围: %s..%s（基点: %s）" % (base[:8], head[:8] or "HEAD", base_source))
     if not raw_diff.strip():
-        print("AI review: no diff to review (skipped)")
-        save_ai_result({"verdict": "skipped", "reason": "无 diff"})
-        return 0
+        return finish_without_scan("无新增 diff", head)
 
     files, skipped = [], {}
     for patch in split_files(raw_diff):
@@ -221,7 +381,7 @@ def main():
         if SKIP_RE.search(path):
             skipped[path] = "范围外文件"
             continue
-        if "GIT binary patch" in patch or "\nBinary files " in patch:
+        if BINARY_RE.search(patch.split("\n@@", 1)[0]):
             skipped[path] = "二进制文件"
             continue
         if not any(l.startswith("+") and not l.startswith("+++") for l in patch.splitlines()):
@@ -230,9 +390,8 @@ def main():
         patch, truncated = cap_patch(patch)
         files.append((path, patch, truncated))
     if not files:
-        print("AI review: all changed files are out of review scope (skipped)")
-        save_ai_result({"verdict": "skipped", "reason": "全部文件在审查范围外", "skipped": skipped})
-        return 0
+        return finish_without_scan("全部文件在审查范围外", head,
+                                   {"skipped": [{"file": p, "reason": r} for p, r in skipped.items()]})
 
     chunks = build_chunks(files)
     overflow_files = []
@@ -284,22 +443,52 @@ def main():
             "message": "%d 个文件超出分片上限未审核: %s" % (len(overflow_files), ", ".join(overflow_files[:5])),
             "suggestion": "提高 AI_REVIEW_MAX_CHUNKS 或拆分提交",
         })
-    verdict = "fail" if any(r.get("verdict") == "fail" for r in results) else "pass"
     truncated = [p for p, _, t in files if t]
+
+    # 遗留台账：上次的阻断级发现逐一对照 HEAD 代码——代码仍在 = 未修复（并入本轮
+    # 报告并继续阻断），已变更或文件删除 = 已修复（出账）。台账与审核基点解耦：
+    # 新提交照常增量审，遗留问题不依赖 LLM 重扫，修复与否由代码内容判定。
+    state = load_state()
+    still_open, resolved = recheck_ledger(state, head)
+    fresh_ledger, matched = [], set()
+    for f in (f for f in findings if severity_of(f) in BLOCK_SEVERITIES):
+        entry = ledger_entry_from(f, head)
+        if not entry:
+            continue
+        hit = next((i for i, e in enumerate(still_open) if i not in matched and same_issue(entry, e)), None)
+        if hit is None:
+            fresh_ledger.append(entry)
+        else:
+            # 本轮扫描重新命中的遗留条目：以本轮信息刷新，保留首次发现时间
+            still_open[hit] = dict(entry,
+                                   first_seen_commit=still_open[hit].get("first_seen_commit", ""),
+                                   first_seen_build=still_open[hit].get("first_seen_build", "-"))
+            matched.add(hit)
+    carried = []
+    for i, e in enumerate(still_open):
+        if i not in matched:
+            findings.append(carried_copy(e))
+            carried.append(e)
+    save_state(still_open + fresh_ledger)
+
+    verdict = "fail" if any(r.get("verdict") == "fail" for r in results) or still_open else "pass"
     hard_findings = [f for f in findings if severity_of(f) in BLOCK_SEVERITIES]
     if skipped:
         print("AI review 跳过文件: %s" % "; ".join("%s(%s)" % (p, reason) for p, reason in list(skipped.items())[:8]))
 
     result = {
         "verdict": verdict,
-        "summary": "%d 个文件 / %d 个分片: %d 条发现%s%s%s" % (
+        "summary": "%d 个文件 / %d 个分片: %d 条发现%s%s%s%s%s" % (
             len(files), len(results), len(findings),
             "，%d 个分片未完成审核" % len(unreviewed) if unreviewed else "",
             "，%d 个文件超出分片上限" % len(overflow_files) if overflow_files else "",
             "，%d 个文件超长截断" % len(truncated) if truncated else "",
+            "，%d 条遗留发现未修复" % len(carried) if carried else "",
+            "，%d 条遗留发现已修复" % len(resolved) if resolved else "",
         ),
         "findings": findings,
         "meta": {
+            "branch": BRANCH,
             "chunks": len(results), "unreviewed_chunks": len(unreviewed),
             "files": len(files),
             "skipped": [{"file": p, "reason": reason} for p, reason in skipped.items()],
@@ -307,6 +496,9 @@ def main():
             "overflow_files": overflow_files,
             "blocking_severities": sorted(BLOCK_SEVERITIES),
             "blocking_findings": len(hard_findings),
+            "carried_findings": len(carried),
+            "resolved_findings": len(resolved),
+            "resolved_detail": ["%s:%s %s" % (e.get("file"), e.get("line"), str(e.get("message"))[:40]) for e in resolved][:8],
         },
     }
     save_ai_result({
@@ -328,7 +520,9 @@ def main():
     if BLOCKING:
         blocking_reasons = []
         if hard_findings:
-            blocking_reasons.append("%d 条 %s 级发现" % (len(hard_findings), "/".join(sorted(BLOCK_SEVERITIES))))
+            blocking_reasons.append("%d 条 %s 级发现%s" % (
+                len(hard_findings), "/".join(sorted(BLOCK_SEVERITIES)),
+                "（含 %d 条历史遗留未修复）" % len(carried) if carried else ""))
         if unreviewed:
             blocking_reasons.append("%d 个分片未完成审核" % len(unreviewed))
         if overflow_files:

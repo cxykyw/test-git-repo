@@ -2,6 +2,12 @@
 
 ## 2026-09-06
 
+- feat: **构建分支参数**——Jenkins 构建时传入 `BRANCH` 选择要构建/审核的分支（默认 main，白名单校验防注入，Checkout 阶段按参数切分支）；审核基点与遗留台账按分支独立存储（`.ai-review-base.<分支>` / `.ai-review-state.<分支>.json`），切换分支互不串扰，旧版无后缀 `.ai-review-base` 自动迁移
+- fix: 无新增 diff 的空重建不再绕过遗留台账——未修复的阻断级发现继续阻断
+- feat: **按严重级别阻断启用**——Jenkinsfile 设 `DIFY_BLOCKING=1`，blocker/critical 级发现（`AI_REVIEW_BLOCK_SEVERITIES` 可调）、未审完分片、超限未审文件使构建失败，打包阶段不执行
+- feat: **遗留发现台账** `.ai-review-state.<分支>.json`——阻断级发现落账（含被标记代码 3 行指纹），每次构建对照 HEAD 自动判定：代码仍在 = 未修复（并入报告、持续阻断，标注首次发现构建号），代码已变/文件删除 = 已修复（出账并在报告标注）。问题修复与否由代码内容判定，不依赖对旧提交的重复扫描；台账与审核基点解耦，新提交照常增量审
+- fix: LLM 输出为合法 JSON 但非对象（裸数组/字符串/数字）时优雅降级为该分片未完成审核，不再因 AttributeError 使整轮审核静默跳过；JSON 解析失败的失败原因带上具体异常（行列号）
+- fix: 二进制文件判定改为仅匹配 diff 头部元信息行——此前 ai_review.py 自身进入 diff 时（源码含判定用字面量）会被误判为二进制文件而跳过漏审
 - feat: **累计审核基点** `.ai-review-base`——多次提交攒一次构建审，整段范围审完才推进基点，杜绝漏审；候选链 `.ai-review-base` → `GIT_PREVIOUS_COMMIT` → `HEAD~1`，`git merge-base` 防历史重写
 - feat: **结构化输出**——LLM 节点启用 JSON Schema（verdict/severity 枚举、findings 字段锁定、additionalProperties=false）；模型凭据 `structured_output_support=supported` 开启原生 response_format 透传
 - feat: **统一人读报告 `report.html`**（make_report.py 渲染），构建产物收敛为 zip + report.html 两项；扫描原始输出迁移至工作区 `scan/` 目录
